@@ -47,6 +47,13 @@ struct G7SettingsView: View {
         return formatter
     }()
 
+    private var dateFormatterWithSeconds: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .medium
+        return formatter
+    }()
+
     var body: some View {
         List {
             Section() {
@@ -81,7 +88,7 @@ struct G7SettingsView: View {
                                  value: viewModel.lastGlucoseString)
                 LabeledDateView(label: LocalizedString("Time", comment: "Field label"),
                                 date: viewModel.latestReadingTimestamp,
-                                dateFormatter: viewModel.dateFormatter)
+                                dateFormatter: dateFormatterWithSeconds)
                 LabeledValueView(label: LocalizedString("Trend", comment: "Field label"),
                                  value: viewModel.lastGlucoseTrendString)
             }
