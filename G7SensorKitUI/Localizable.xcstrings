@@ -920,7 +920,7 @@
         },
         "fi" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Configuration"
           }
         },
@@ -932,7 +932,7 @@
         },
         "he" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Configuration"
           }
         },
@@ -962,7 +962,7 @@
         },
         "pl" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Configuration"
           }
         },
@@ -976,6 +976,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Ajustes"
+          }
+        },
+        "ro" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Configurare"
           }
         },
         "ru" : {
@@ -1027,7 +1033,7 @@
       "localizations" : {
         "ar" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Connected"
           }
         },
@@ -1069,7 +1075,7 @@
         },
         "hu" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Connected"
           }
         },
@@ -1107,6 +1113,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Conectado"
+          }
+        },
+        "ro" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conectat"
           }
         },
         "ru" : {
@@ -1158,7 +1170,7 @@
       "localizations" : {
         "ar" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Connecting"
           }
         },
@@ -1200,7 +1212,7 @@
         },
         "hu" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Connecting"
           }
         },
@@ -1238,6 +1250,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Conectando"
+          }
+        },
+        "ro" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Se conectează"
           }
         },
         "ru" : {
@@ -1325,13 +1343,13 @@
         },
         "he" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Continue"
           }
         },
         "hu" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Continue"
           }
         },
@@ -1369,6 +1387,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Continuar"
+          }
+        },
+        "ro" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Continuați"
           }
         },
         "ru" : {
@@ -1759,7 +1783,7 @@
         },
         "he" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Done"
           }
         },
@@ -1773,6 +1797,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Fine"
+          }
+        },
+        "nb" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ferdig"
           }
         },
         "nb-NO" : {
@@ -1789,7 +1819,7 @@
         },
         "pl" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Done"
           }
         },
@@ -1803,6 +1833,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "OK"
+          }
+        },
+        "ro" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gata"
           }
         },
         "ru" : {
@@ -2005,7 +2041,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "葡萄糖"
+            "value" : "血糖"
           }
         }
       }
@@ -2082,7 +2118,7 @@
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Oppvarming ferdig"
+            "value" : "Reserveperiode utløpt"
           }
         },
         "nb-NO" : {
@@ -2237,7 +2273,7 @@
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Gjenstående oppvarmingsperiode"
+            "value" : "Reserveperiode utløper om"
           }
         },
         "nb-NO" : {
@@ -2613,7 +2649,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Last Connect"
+            "value" : "上次连接"
           }
         }
       }
@@ -3384,7 +3420,7 @@
         },
         "fi" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Scanning"
           }
         },
@@ -3396,13 +3432,13 @@
         },
         "he" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Scanning"
           }
         },
         "hu" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Scanning"
           }
         },
@@ -3426,7 +3462,7 @@
         },
         "pl" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Scanning"
           }
         },
@@ -3438,8 +3474,14 @@
         },
         "pt-BR" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Scanning"
+          }
+        },
+        "ro" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Se scanează"
           }
         },
         "ru" : {
@@ -3480,7 +3522,7 @@
         },
         "zh-Hans" : {
           "stringUnit" : {
-            "state" : "new",
+            "state" : "translated",
             "value" : "Scanning"
           }
         }
@@ -3588,7 +3630,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Detectarea senzorului"
+            "value" : "Detectarea\nSenzorului"
           }
         },
         "ru" : {
@@ -3886,7 +3928,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Senzorul a expirat"
+            "value" : "Senzor\nExpirat"
           }
         },
         "ru" : {
@@ -4035,7 +4077,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Senzorul a eșuat"
+            "value" : "Senzor\nEșuat"
           }
         },
         "ru" : {
@@ -4184,7 +4226,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Problemă cu senzorul"
+            "value" : "Problemă\nSenzor"
           }
         },
         "ru" : {
@@ -4333,7 +4375,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Senzorul se încălzește"
+            "value" : "Încălzire\nSenzor"
           }
         },
         "ru" : {
@@ -4482,7 +4524,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Expirarea senzorului"
+            "value" : "Expirare Senzor"
           }
         },
         "ru" : {
@@ -5090,7 +5132,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Pornirea senzorului"
+            "value" : "Pornire Senzor"
           }
         },
         "ru" : {
@@ -5239,7 +5281,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Pierdere de semnal"
+            "value" : "Pierdere\nSemnal"
           }
         },
         "ru" : {
@@ -5543,7 +5585,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Tendinţă"
+            "value" : "Tendință"
           }
         },
         "ru" : {
@@ -5841,7 +5883,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Încălzirea s-a încheiat"
+            "value" : "Încălzire încheiată"
           }
         },
         "ru" : {
