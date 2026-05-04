@@ -357,6 +357,7 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
+        emitG7Telemetry("did_connect peripheral=\(peripheral.identifier.uuidString) name=\(peripheral.name ?? "nil")")
 
         log.default("%{public}@: %{public}@", #function, peripheral)
 
@@ -401,6 +402,7 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
+        emitG7Telemetry("did_fail_to_connect peripheral=\(peripheral.identifier.uuidString) name=\(peripheral.name ?? "nil") error=\(error?.localizedDescription ?? "nil")")
 
         log.error("%{public}@: %{public}@", #function, String(describing: error))
         if let error = error, let peripheralManager = activePeripheralManager {
