@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		3B0FD2A52D803BF100E5E921 /* LoopKitUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3B0FD2A42D803BF000E5E921 /* LoopKitUI.framework */; };
+		54A120772FA937D100AB0BE8 /* G7Telemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54A120762FA937D100AB0BE8 /* G7Telemetry.swift */; };
 		B60BB2E42BC649DA00D2BB39 /* Bundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B60BB2E32BC649DA00D2BB39 /* Bundle.swift */; };
 		B66D1F6D2E6A803800471149 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = B66D1F6C2E6A803800471149 /* Localizable.xcstrings */; };
 		B66D1F6F2E6A803800471149 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = B66D1F6E2E6A803800471149 /* Localizable.xcstrings */; };
@@ -111,6 +112,7 @@
 
 /* Begin PBXFileReference section */
 		3B0FD2A42D803BF000E5E921 /* LoopKitUI.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; path = LoopKitUI.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		54A120762FA937D100AB0BE8 /* G7Telemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = G7Telemetry.swift; sourceTree = "<group>"; };
 		B60BB2E32BC649DA00D2BB39 /* Bundle.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; name = Bundle.swift; path = G7SensorKitUI/Extensions/Bundle.swift; sourceTree = SOURCE_ROOT; };
 		B66D1F6C2E6A803800471149 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		B66D1F6E2E6A803800471149 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
@@ -254,6 +256,7 @@
 		C17F50DE291EAC6500555EB5 /* G7CGMManager */ = {
 			isa = PBXGroup;
 			children = (
+				54A120762FA937D100AB0BE8 /* G7Telemetry.swift */,
 				C17F50DF291EAC6500555EB5 /* G7BackfillMessage.swift */,
 				C17F50E7291EAC6500555EB5 /* G7BluetoothManager.swift */,
 				C17F50E5291EAC6500555EB5 /* G7CGMManager.swift */,
@@ -575,6 +578,7 @@
 				C17F50E9291EAC6500555EB5 /* G7BackfillMessage.swift in Sources */,
 				C17F50ED291EAC6500555EB5 /* G7Opcode.swift in Sources */,
 				C17F5140291EB27D00555EB5 /* TimeInterval.swift in Sources */,
+				54A120772FA937D100AB0BE8 /* G7Telemetry.swift in Sources */,
 				C17F50F0291EAC6500555EB5 /* G7CGMManagerState.swift in Sources */,
 				C17F5145291EB45900555EB5 /* CBPeripheral.swift in Sources */,
 				C107607F2F059130008B2B39 /* ExtendedVersionMessage.swift in Sources */,
