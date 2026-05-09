@@ -212,6 +212,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             do {
                 try peripheral.listenToCharacteristic(.authentication)
                 self.pendingAuth = true
+                emitG7Telemetry("auth_notify_subscribed peripheral=\(peripheralID)")
                 emitG7Telemetry("auth_notify_requested peripheral=\(peripheralID)")
             } catch let error {
                 emitG7Telemetry("auth_notify_failed peripheral=\(peripheralID) error=\(error.localizedDescription)")
@@ -344,13 +345,29 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
     func bluetoothManager(_ manager: G7BluetoothManager, peripheralManager: G7PeripheralManager, didReceiveAuthenticationResponse response: Data) {
 
-        if let message = AuthChallengeRxMessage(data: response), message.isBonded, message.isAuthenticated {
+        let opcode = response.first ?? 0xFF
+        let authByte = response.count > 1 ? response[1] : 0xFF
+        let bondByte = response.count > 2 ? response[2] : 0xFF
+        let payloadHex = response.count <= 8
+            ? response.map { String(format: "%02X", $0) }.joined()
+            : "omitted"
+
+        guard let message = AuthChallengeRxMessage(data: response) else {
+            emitG7Telemetry("auth_value_received opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=false")
+            emitG7Telemetry("auth_payload_ignored bytes=\(response.count)")
+            log.debug("Ignoring authentication response: %{public}@", response.hexadecimalString)
+            return
+        }
+        let gatePass = message.isAuthenticated && message.isBonded
+        emitG7Telemetry("auth_value_received opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=\(gatePass)")
+        if gatePass {
             log.debug("Observed authenticated session. enabling notifications for control characteristic.")
             pendingAuth = false
             emitG7Telemetry("auth_authenticated_bonded peripheral=\(peripheralManager.peripheral.identifier.uuidString)")
             peripheralManager.perform { (peripheral) in
                 do {
                     try peripheral.listenToCharacteristic(.control)
+                    emitG7Telemetry("control_notify_subscribed peripheral=\(peripheralManager.peripheral.identifier.uuidString)")
                 } catch let error {
                     emitG7Telemetry("control_notify_failed error=\(error.localizedDescription)")
                     self.log.error("Error trying to enable notifications on control characteristic: %{public}@", String(describing: error))

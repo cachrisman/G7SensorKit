@@ -201,13 +201,16 @@ class G7BluetoothManager: NSObject {
 
         if let peripheralID = activePeripheralIdentifier, let peripheral = centralManager.retrievePeripherals(withIdentifiers: [peripheralID]).first {
             log.default("Retrieved peripheral %{public}@", peripheral.identifier.uuidString)
+            emitG7Telemetry("attach_path path=stored_id peripheral=\(peripheral.identifier.uuidString) name=\(peripheral.name ?? "nil")")
             handleDiscoveredPeripheral(peripheral)
         } else {
+            emitG7Telemetry("attach_path path=miss has_identifier=\(activePeripheralIdentifier != nil)")
             for peripheral in centralManager.retrieveConnectedPeripherals(withServices: [
                 SensorServiceUUID.advertisement.cbUUID,
                 SensorServiceUUID.cgmService.cbUUID
             ]) {
                 log.default("Found system-connected peripheral: %{public}@", peripheral.identifier.uuidString)
+                emitG7Telemetry("attach_path path=connected_peripherals peripheral=\(peripheral.identifier.uuidString) name=\(peripheral.name ?? "nil")")
                 handleDiscoveredPeripheral(peripheral)
             }
         }
@@ -220,6 +223,7 @@ class G7BluetoothManager: NSObject {
                 SensorServiceUUID.cgmService.cbUUID
             ]])
 
+            emitG7Telemetry("attach_path path=scan")
             centralManager.scanForPeripherals(withServices: [
                     SensorServiceUUID.advertisement.cbUUID
                 ],

@@ -17,7 +17,7 @@ import Foundation
 public enum G7Telemetry {
     /// Set by the host app at startup. When nil, all emissions are no-ops.
     /// Closure receives the fully formatted line, e.g.:
-    ///   "event=g7_ble_ios connect_called peripheral=ABCD-... name=DXCMQU"
+    ///   "module=g7_core event=connect_called peripheral=ABCD-... name=DXCMQU"
     public static var emit: ((String) -> Void)?
 
     /// Serial queue for async telemetry dispatch.
@@ -29,13 +29,13 @@ public enum G7Telemetry {
     )
 }
 
-/// Internal helper. Formats `<subevent> <kv pairs>` with the `event=g7_ble_ios` prefix
+/// Internal helper. Formats `<subevent> <kv pairs>` with the `module=g7_core event=<name>` prefix
 /// and dispatches async through the telemetry serial queue.
 /// No-op (single nil check) if G7Telemetry.emit is unset.
 @inline(__always)
 internal func emitG7Telemetry(_ event: String) {
     guard let emit = G7Telemetry.emit else { return }
-    let formatted = "event=g7_ble_ios \(event)"
+    let formatted = "module=g7_core event=\(event)"
     G7Telemetry.queue.async {
         emit(formatted)
     }

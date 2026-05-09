@@ -205,7 +205,7 @@ extension CBManagerState {
         case .poweredOff:
             return "poweredOff"
         case .poweredOn:
-            return "poweredOff"
+            return "poweredOn"
         case .resetting:
             return "resetting"
         case .unauthorized:
