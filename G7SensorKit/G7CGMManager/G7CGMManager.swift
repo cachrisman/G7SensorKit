@@ -6,6 +6,8 @@
 //  Copyright © 2022 LoopKit Authors. All rights reserved.
 //
 
+#if os(iOS)
+
 import Foundation
 import LoopKit
 import os.log
@@ -514,3 +516,5 @@ extension G7GlucoseMessage: GlucoseDisplayable {
         }
     }
 }
+
+#endif

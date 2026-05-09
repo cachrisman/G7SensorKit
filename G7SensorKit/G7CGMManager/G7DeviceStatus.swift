@@ -6,6 +6,8 @@
 //  Copyright © 2022 LoopKit Authors. All rights reserved.
 //
 
+#if os(iOS)
+
 import LoopKit
 import LoopKitUI
 
@@ -20,3 +22,4 @@ public struct G7DeviceStatusHighlight: DeviceStatusHighlight, Equatable {
     }
 }
 
+#endif

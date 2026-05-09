@@ -6,6 +6,8 @@
 //  Copyright © 2022 LoopKit Authors. All rights reserved.
 //
 
+#if os(iOS)
+
 import Foundation
 import LoopKit
 
@@ -50,3 +52,5 @@ public struct G7CGMManagerState: RawRepresentable, Equatable {
         return rawValue
     }
 }
+
+#endif

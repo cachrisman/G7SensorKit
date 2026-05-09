@@ -7,7 +7,9 @@
 //
 
 import Foundation
+#if os(iOS)
 import LoopKit
+#endif
 
 public struct G7BackfillMessage: Equatable {
 
@@ -56,6 +58,7 @@ public struct G7BackfillMessage: Equatable {
         self.data = data
     }
 
+#if os(iOS)
     public var trendType: LoopKit.GlucoseTrend? {
         guard let trend = trend else {
             return nil
@@ -92,6 +95,7 @@ public struct G7BackfillMessage: Equatable {
             return nil
         }
     }
+#endif
 }
 
 extension G7BackfillMessage: CustomDebugStringConvertible {
