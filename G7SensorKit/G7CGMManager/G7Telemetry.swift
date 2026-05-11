@@ -3,7 +3,7 @@
 //  G7SensorKit
 //
 //  Optional structured-telemetry sink for Build 192/193 comparison work.
-//  Default: no-op. Trio iOS sets `G7Telemetry.emit` at startup to forward
+//  Default: no-op. Trio sets `G7Telemetry.emit` at startup to forward
 //  events to its logger / BetterStack. Other consumers (e.g. Loop) get
 //  zero overhead.
 //
@@ -14,29 +14,35 @@
 
 import Foundation
 
+/// One telemetry emission: short `event` token plus optional `key=value` fields (no `module=` / `sensor_name=` — host adds those).
+public struct G7TelemetryPayload: Sendable {
+    public let event: String
+    public let fields: String
+
+    public init(event: String, fields: String = "") {
+        self.event = event
+        self.fields = fields
+    }
+}
+
 public enum G7Telemetry {
     /// Set by the host app at startup. When nil, all emissions are no-ops.
-    /// Closure receives the fully formatted line, e.g.:
-    ///   "module=g7_core event=connect_called peripheral=ABCD-... name=DXCMQU"
-    public static var emit: ((String) -> Void)?
+    /// Receives structured payload; host formats `module=g7_core sensor_name=… event=… … g7_session=…`.
+    public static var emit: ((G7TelemetryPayload) -> Void)?
 
     /// Serial queue for async telemetry dispatch.
-    /// Serial (not concurrent) to preserve emission ordering —
-    /// rapid-fire events like connect_called/did_connect must arrive in order.
     fileprivate static let queue = DispatchQueue(
         label: "com.g7sensorkit.telemetry",
         qos: .utility
     )
 }
 
-/// Internal helper. Formats `<subevent> <kv pairs>` with the `module=g7_core event=<name>` prefix
-/// and dispatches async through the telemetry serial queue.
-/// No-op (single nil check) if G7Telemetry.emit is unset.
+/// Dispatches `event` + optional `fields` to `G7Telemetry.emit`. No `name=` — host supplies `sensor_name`.
 @inline(__always)
-internal func emitG7Telemetry(_ event: String) {
+internal func emitG7Telemetry(_ event: String, _ fields: String = "") {
     guard let emit = G7Telemetry.emit else { return }
-    let formatted = "module=g7_core event=\(event)"
+    let payload = G7TelemetryPayload(event: event, fields: fields)
     G7Telemetry.queue.async {
-        emit(formatted)
+        emit(payload)
     }
 }

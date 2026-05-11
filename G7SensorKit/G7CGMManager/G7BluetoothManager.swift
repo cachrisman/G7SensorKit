@@ -201,16 +201,16 @@ class G7BluetoothManager: NSObject {
 
         if let peripheralID = activePeripheralIdentifier, let peripheral = centralManager.retrievePeripherals(withIdentifiers: [peripheralID]).first {
             log.default("Retrieved peripheral %{public}@", peripheral.identifier.uuidString)
-            emitG7Telemetry("attach_path path=stored_id peripheral=\(peripheral.identifier.uuidString) name=\(peripheral.name ?? "nil")")
+            emitG7Telemetry("attach_path", "path=stored_id peripheral=\(peripheral.identifier.uuidString)")
             handleDiscoveredPeripheral(peripheral)
         } else {
-            emitG7Telemetry("attach_path path=miss has_identifier=\(activePeripheralIdentifier != nil)")
+            emitG7Telemetry("attach_path", "path=miss has_identifier=\(activePeripheralIdentifier != nil)")
             for peripheral in centralManager.retrieveConnectedPeripherals(withServices: [
                 SensorServiceUUID.advertisement.cbUUID,
                 SensorServiceUUID.cgmService.cbUUID
             ]) {
                 log.default("Found system-connected peripheral: %{public}@", peripheral.identifier.uuidString)
-                emitG7Telemetry("attach_path path=connected_peripherals peripheral=\(peripheral.identifier.uuidString) name=\(peripheral.name ?? "nil")")
+                emitG7Telemetry("attach_path", "path=connected_peripherals peripheral=\(peripheral.identifier.uuidString)")
                 handleDiscoveredPeripheral(peripheral)
             }
         }
@@ -223,7 +223,7 @@ class G7BluetoothManager: NSObject {
                 SensorServiceUUID.cgmService.cbUUID
             ]])
 
-            emitG7Telemetry("attach_path path=scan")
+            emitG7Telemetry("attach_path", "path=scan")
             centralManager.scanForPeripherals(withServices: [
                     SensorServiceUUID.advertisement.cbUUID
                 ],
@@ -361,7 +361,7 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
-        emitG7Telemetry("did_connect peripheral=\(peripheral.identifier.uuidString) name=\(peripheral.name ?? "nil")")
+        emitG7Telemetry("did_connect", "peripheral=\(peripheral.identifier.uuidString)")
 
         log.default("%{public}@: %{public}@", #function, peripheral)
 
@@ -406,7 +406,10 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
-        emitG7Telemetry("did_fail_to_connect peripheral=\(peripheral.identifier.uuidString) name=\(peripheral.name ?? "nil") error=\(error?.localizedDescription ?? "nil")")
+        emitG7Telemetry(
+            "did_fail_to_connect",
+            "peripheral=\(peripheral.identifier.uuidString) error=\(error?.localizedDescription ?? "nil")"
+        )
 
         log.error("%{public}@: %{public}@", #function, String(describing: error))
         if let error = error, let peripheralManager = activePeripheralManager {

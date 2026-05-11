@@ -145,7 +145,7 @@ extension G7PeripheralManager {
                         self.log.error("No delegate set configured")
                     }
                 } catch let error {
-                    emitG7Telemetry("configuration_failed error=\(String(describing: error))")
+                    emitG7Telemetry("configuration_failed", "error=\(String(describing: error))")
                     self.log.error("Error applying peripheral configuration: %{public}@", String(describing: error))
                     // Will retry
                 }
@@ -276,7 +276,7 @@ extension G7PeripheralManager {
         }
 
         guard signaled else {
-            emitG7Telemetry("command_timeout timeout_s=\(Int(timeout))")
+            emitG7Telemetry("command_timeout", "timeout_s=\(Int(timeout))")
             throw PeripheralManagerError.timeout
         }
 

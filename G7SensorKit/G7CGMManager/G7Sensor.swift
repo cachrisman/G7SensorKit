@@ -98,7 +98,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     private var sensorID: String?
 
     private func emitG7TelemetrySensorLocked(_ name: String) {
-        emitG7Telemetry("sensor_name_locked name=\(name)")
+        emitG7Telemetry("sensor_name_locked", "locked_name=\(name)")
     }
 
     public init(sensorID: String?) {
@@ -132,7 +132,10 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     private func handleGlucoseMessage(message: G7GlucoseMessage, peripheralManager: G7PeripheralManager) {
         let trendStr = message.trend.map { String(format: "%.1f", $0) } ?? "nil"
         let glucoseStr = message.glucose.map { String($0) } ?? "nil"
-        emitG7Telemetry("egv_received glucose=\(glucoseStr) sequence=\(message.sequence) algorithm_state=\(message.algorithmState.rawValue) age_s=\(message.age) message_timestamp=\(message.messageTimestamp) trend_rate=\(trendStr) display_only=\(message.glucoseIsDisplayOnly)")
+        emitG7Telemetry(
+            "egv_received",
+            "glucose=\(glucoseStr) sequence=\(message.sequence) algorithm_state=\(message.algorithmState.rawValue) age_s=\(message.age) message_timestamp=\(message.messageTimestamp) trend_rate=\(trendStr) display_only=\(message.glucoseIsDisplayOnly)"
+        )
         activationDate = Date().addingTimeInterval(-TimeInterval(message.messageTimestamp))
         peripheralManager.perform { (peripheral) in
             self.log.debug("Listening for backfill responses")
@@ -140,7 +143,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             do {
                 try peripheral.listenToCharacteristic(.backfill)
             } catch let error {
-                emitG7Telemetry("backfill_notify_failed error=\(error.localizedDescription)")
+                emitG7Telemetry("backfill_notify_failed", "error=\(error.localizedDescription)")
                 self.log.error("Error trying to enable notifications on backfill characteristic: %{public}@", String(describing: error))
                 self.delegateQueue.async {
                     self.delegate?.sensor(self, didError: error)
@@ -198,7 +201,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         let peripheralName = peripheralManager.peripheral.name ?? "nil"
         let peripheralID = peripheralManager.peripheral.identifier.uuidString
         let isFollowing = (sensorID != nil && sensorID == peripheralName)
-        emitG7Telemetry("gatt_ready peripheral=\(peripheralID) name=\(peripheralName) following_known=\(isFollowing)")
+        emitG7Telemetry("gatt_ready", "peripheral=\(peripheralID) following_known=\(isFollowing)")
 
         if let sensorID = sensorID, sensorID == peripheralManager.peripheral.name {
             shouldStopScanning = true
@@ -212,10 +215,10 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             do {
                 try peripheral.listenToCharacteristic(.authentication)
                 self.pendingAuth = true
-                emitG7Telemetry("auth_notify_subscribed peripheral=\(peripheralID)")
-                emitG7Telemetry("auth_notify_requested peripheral=\(peripheralID)")
+                emitG7Telemetry("auth_notify_subscribed", "peripheral=\(peripheralID)")
+                emitG7Telemetry("auth_notify_requested", "peripheral=\(peripheralID)")
             } catch let error {
-                emitG7Telemetry("auth_notify_failed peripheral=\(peripheralID) error=\(error.localizedDescription)")
+                emitG7Telemetry("auth_notify_failed", "peripheral=\(peripheralID) error=\(error.localizedDescription)")
                 self.delegateQueue.async {
                     self.delegate?.sensor(self, didError: error)
                 }
@@ -234,7 +237,10 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         let peripheralName = peripheralManager.peripheral.name ?? "nil"
         let peripheralID = peripheralManager.peripheral.identifier.uuidString
         let isFollowed = (sensorID != nil && sensorID == peripheralName)
-        emitG7Telemetry("disconnect peripheral=\(peripheralID) name=\(peripheralName) was_remote=\(wasRemoteDisconnect) pending_auth=\(pendingAuth) followed=\(isFollowed)")
+        emitG7Telemetry(
+            "disconnect",
+            "peripheral=\(peripheralID) was_remote=\(wasRemoteDisconnect) pending_auth=\(pendingAuth) followed=\(isFollowed)"
+        )
         if let sensorID = sensorID, sensorID == peripheralManager.peripheral.name {
 
             // Sometimes we do not receive the backfillFinished message before disconnect
@@ -245,7 +251,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             self.log.info("Sensor disconnected: wasRemoteDisconnect:%{public}@", String(describing: wasRemoteDisconnect))
             if pendingAuth, wasRemoteDisconnect {
                 suspectedEndOfSession = true // Normal disconnect without auth is likely that G7 app stopped this session
-                emitG7Telemetry("suspected_end_of_session prior_name=\(sensorID)")
+                emitG7Telemetry("suspected_end_of_session", "prior_name=\(sensorID)")
             } else {
                 suspectedEndOfSession = false
             }
@@ -269,10 +275,10 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         if name.hasPrefix("DXCM") || name.hasPrefix("DX02"){
             // If we're following this name or if we're scanning, connect
             if let sensorName = sensorID, name.suffix(2) == sensorName.suffix(2) {
-                emitG7Telemetry("connect_called intent=makeActive peripheral=\(peripheral.identifier.uuidString) name=\(name)")
+                emitG7Telemetry("connect_called", "intent=makeActive peripheral=\(peripheral.identifier.uuidString)")
                 return .makeActive
             } else if sensorID == nil {
-                emitG7Telemetry("connect_called intent=connect peripheral=\(peripheral.identifier.uuidString) name=\(name)")
+                emitG7Telemetry("connect_called", "intent=connect peripheral=\(peripheral.identifier.uuidString)")
                 return .connect
             }
         }
@@ -292,7 +298,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             if let glucoseMessage = G7GlucoseMessage(data: response) {
                 handleGlucoseMessage(message: glucoseMessage, peripheralManager: peripheralManager)
             } else {
-                emitG7Telemetry("egv_parse_failed bytes=\(response.count)")
+                emitG7Telemetry("egv_parse_failed", "bytes=\(response.count)")
                 delegateQueue.async {
                     self.delegate?.sensor(self, didError: G7SensorError.observationError("Unable to handle glucose control response"))
                 }
@@ -307,7 +313,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
                 }
             }
         case .backfillFinished:
-            emitG7Telemetry("backfill_finished bytes=\(response.count)")
+            emitG7Telemetry("backfill_finished", "bytes=\(response.count)")
             flushBackfillBuffer()
         default:
             break
@@ -317,11 +323,14 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     func flushBackfillBuffer() {
         if backfillBuffer.count > 0 {
             let backfill = backfillBuffer
-            emitG7Telemetry("backfill_flush count=\(backfill.count)")
+            emitG7Telemetry("backfill_flush", "count=\(backfill.count)")
             for entry in backfill {
                 let bgStr = entry.glucose.map { String($0) } ?? "nil"
                 let trStr = entry.trend.map { String(format: "%.1f", $0) } ?? "nil"
-                emitG7Telemetry("backfill_entry timestamp=\(entry.timestamp) glucose=\(bgStr) algorithm_state=\(entry.algorithmState.rawValue) display_only=\(entry.glucoseIsDisplayOnly) trend=\(trStr)")
+                emitG7Telemetry(
+                    "backfill_entry",
+                    "timestamp=\(entry.timestamp) glucose=\(bgStr) algorithm_state=\(entry.algorithmState.rawValue) display_only=\(entry.glucoseIsDisplayOnly) trend=\(trStr)"
+                )
             }
             self.backfillBuffer = []
             delegateQueue.async {
@@ -353,23 +362,29 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             : "omitted"
 
         guard let message = AuthChallengeRxMessage(data: response) else {
-            emitG7Telemetry("auth_value_received opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=false")
-            emitG7Telemetry("auth_payload_ignored bytes=\(response.count)")
+            emitG7Telemetry(
+                "auth_value_received",
+                "opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=false"
+            )
+            emitG7Telemetry("auth_payload_ignored", "bytes=\(response.count)")
             log.debug("Ignoring authentication response: %{public}@", response.hexadecimalString)
             return
         }
         let gatePass = message.isAuthenticated && message.isBonded
-        emitG7Telemetry("auth_value_received opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=\(gatePass)")
+        emitG7Telemetry(
+            "auth_value_received",
+            "opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=\(gatePass)"
+        )
         if gatePass {
             log.debug("Observed authenticated session. enabling notifications for control characteristic.")
             pendingAuth = false
-            emitG7Telemetry("auth_authenticated_bonded peripheral=\(peripheralManager.peripheral.identifier.uuidString)")
+            emitG7Telemetry("auth_authenticated_bonded", "peripheral=\(peripheralManager.peripheral.identifier.uuidString)")
             peripheralManager.perform { (peripheral) in
                 do {
                     try peripheral.listenToCharacteristic(.control)
-                    emitG7Telemetry("control_notify_subscribed peripheral=\(peripheralManager.peripheral.identifier.uuidString)")
+                    emitG7Telemetry("control_notify_subscribed", "peripheral=\(peripheralManager.peripheral.identifier.uuidString)")
                 } catch let error {
-                    emitG7Telemetry("control_notify_failed error=\(error.localizedDescription)")
+                    emitG7Telemetry("control_notify_failed", "error=\(error.localizedDescription)")
                     self.log.error("Error trying to enable notifications on control characteristic: %{public}@", String(describing: error))
                     self.delegateQueue.async {
                         self.delegate?.sensor(self, didError: error)
@@ -377,7 +392,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
                 }
             }
         } else {
-            emitG7Telemetry("auth_payload_ignored bytes=\(response.count)")
+            emitG7Telemetry("auth_payload_ignored", "bytes=\(response.count)")
             log.debug("Ignoring authentication response: %{public}@", response.hexadecimalString)
         }
     }
@@ -387,7 +402,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         // If this still deadlocks in practice, drop the boolean and log just the event.
         DispatchQueue.global(qos: .utility).async {
             let scanning = manager.isScanning
-            emitG7Telemetry("scanning_status_changed scanning=\(scanning)")
+            emitG7Telemetry("scanning_status_changed", "scanning=\(scanning)")
         }
         self.delegateQueue.async {
             self.delegate?.sensorConnectionStatusDidUpdate(self)
