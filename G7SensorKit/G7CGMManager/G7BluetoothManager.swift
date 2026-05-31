@@ -271,6 +271,23 @@ class G7BluetoothManager: NSObject {
         return isConnected
     }
 
+    /// Issue a CoreBluetooth connect only when the peripheral is not already connecting or
+    /// connected. Discovery callbacks fan in from several paths (scan restart, connectionEvent,
+    /// willRestoreState, didDiscover); without this guard each can stack a redundant
+    /// `connect(peripheral)` on an already-in-flight connection. Skipped calls are recorded so the
+    /// dedup is observable in telemetry.
+    private func connectIfNotInFlight(_ peripheral: CBPeripheral) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        guard peripheral.state != .connecting, peripheral.state != .connected else {
+            emitG7Telemetry(
+                "connect_skipped",
+                "reason=in_flight peripheral=\(peripheral.identifier.uuidString) state=\(peripheral.state.rawValue)"
+            )
+            return
+        }
+        centralManager.connect(peripheral)
+    }
+
     private func handleDiscoveredPeripheral(_ peripheral: CBPeripheral) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
 
@@ -290,11 +307,11 @@ class G7BluetoothManager: NSObject {
                     activePeripheralManager?.delegate = self
                 }
                 self.managedPeripherals[peripheral.identifier] = activePeripheralManager
-                self.centralManager.connect(peripheral)
+                self.connectIfNotInFlight(peripheral)
 
             case .connect:
                 log.default("Connecting to peripheral: %{public}@", peripheral.identifier.uuidString)
-                self.centralManager.connect(peripheral)
+                self.connectIfNotInFlight(peripheral)
                 let peripheralManager = G7PeripheralManager(
                     peripheral: peripheral,
                     configuration: .dexcomG7,
