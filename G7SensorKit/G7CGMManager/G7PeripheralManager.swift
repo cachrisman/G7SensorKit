@@ -38,6 +38,7 @@ class G7PeripheralManager: NSObject {
 
             queue.sync {
                 self.needsConfiguration = true
+                self.cancelConfigurationRetry() // C3: stale peripheral — drop the pending retry block
             }
         }
     }
@@ -61,10 +62,18 @@ class G7PeripheralManager: NSObject {
     // Confined to `queue`
     private var needsConfiguration = true
 
+    // C3 (build 205): bounded, fail-closed retry of a configuration block that was skipped because
+    // configuration failed. All confined to `queue`. First-wins — never replace a pending retry, so
+    // the dominant skipped op (the initial auth subscription) survives; reset on configuration success.
+    private var configurationRetryWorkItem: DispatchWorkItem?
+    private var configurationRetryAttempts = 0
+    private let maxConfigurationRetryAttempts = 5
+
     weak var delegate: G7PeripheralManagerDelegate? {
         didSet {
             queue.sync {
                 needsConfiguration = true
+                cancelConfigurationRetry() // C3
             }
         }
     }
@@ -127,7 +136,7 @@ protocol G7PeripheralManagerDelegate: AnyObject {
 
 // MARK: - Operation sequence management
 extension G7PeripheralManager {
-    func configureAndRun(_ block: @escaping (_ manager: G7PeripheralManager) -> Void) -> (() -> Void) {
+    func configureAndRun(_ block: @escaping (_ manager: G7PeripheralManager) -> Void, retryOnConfigFailure: Bool = true) -> (() -> Void) {
         return {
             if !self.needsConfiguration && self.peripheral.services == nil {
                 self.log.error("Configured peripheral has no services. Reconfiguring…")
@@ -141,13 +150,26 @@ extension G7PeripheralManager {
                         try delegate.completeConfiguration(for: self)
                         self.log.default("Delegate configuration completed")
                         self.needsConfiguration = false
+                        self.configurationRetryAttempts = 0 // C3: success resets the retry budget
                     } else {
                         self.log.error("No delegate set configured")
                     }
                 } catch let error {
-                    emitG7Telemetry("configuration_failed", "error=\(String(describing: error))")
-                    self.log.error("Error applying peripheral configuration: %{public}@", String(describing: error))
-                    // Will retry
+                    // C3: FAIL CLOSED. Running `block` against a peripheral whose characteristics were
+                    // never discovered yields no EGV (config churn). Skip the block, keep
+                    // needsConfiguration, and schedule a bounded retry that re-runs THIS block once
+                    // configuration recovers.
+                    emitG7Telemetry("configure_block_skipped", "error=\(String(describing: error))")
+                    self.log.error("Peripheral configuration failed; skipping operation block: %{public}@", String(describing: error))
+                    self.needsConfiguration = true
+                    // Only real operation blocks arm the bounded retry. The no-op assertConfiguration
+                    // probe passes retryOnConfigFailure=false: otherwise its (empty) retry could first-win
+                    // the single retry slot and a real auth/control block's retry would be dropped
+                    // (configure_retry_already_pending) — silently losing the EGV subscription.
+                    if retryOnConfigFailure {
+                        self.scheduleConfigurationRetry(rerunning: block)
+                    }
+                    return
                 }
 
             }
@@ -156,13 +178,57 @@ extension G7PeripheralManager {
         }
     }
 
-    func perform(_ block: @escaping (_ manager: G7PeripheralManager) -> Void) {
-        queue.async(execute: configureAndRun(block))
+    func perform(_ block: @escaping (_ manager: G7PeripheralManager) -> Void, retryOnConfigFailure: Bool = true) {
+        queue.async(execute: configureAndRun(block, retryOnConfigFailure: retryOnConfigFailure))
+    }
+
+    /// C3: schedule a bounded, fail-closed retry that re-runs the skipped `block` once configuration
+    /// recovers. First-wins (never replaces a pending retry, so the dominant skipped op — the auth
+    /// subscription — survives); clears the slot before re-entering `perform` so a re-failure can
+    /// schedule the next attempt; abandons if the peripheral disconnected; capped attempt count.
+    private func scheduleConfigurationRetry(rerunning block: @escaping (_ manager: G7PeripheralManager) -> Void) {
+        queue.async {
+            guard self.configurationRetryWorkItem == nil else {
+                emitG7Telemetry("configure_retry_already_pending")
+                return
+            }
+            guard self.configurationRetryAttempts < self.maxConfigurationRetryAttempts else {
+                emitG7Telemetry("configure_retry_exhausted", "attempts=\(self.configurationRetryAttempts)")
+                return
+            }
+            self.needsConfiguration = true
+            let attempt = self.configurationRetryAttempts
+            let backoff = min(60.0, Double(2 << attempt)) // 2,4,8,16,32s, capped at 60
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.queue.async {
+                    self.configurationRetryWorkItem = nil // clear BEFORE re-entering perform
+                    guard self.peripheral.state == .connected else {
+                        emitG7Telemetry("configure_retry_abandoned", "reason=disconnected")
+                        return
+                    }
+                    self.perform(block) // a re-failure re-enters this path and schedules the next attempt
+                }
+            }
+            self.configurationRetryWorkItem = work
+            self.configurationRetryAttempts += 1
+            emitG7Telemetry("configure_retry_scheduled", "attempt=\(attempt) backoff_s=\(Int(backoff))")
+            self.queue.asyncAfter(deadline: .now() + backoff, execute: work)
+        }
+    }
+
+    /// C3: cancel any pending configuration retry. Must be called on `queue`.
+    private func cancelConfigurationRetry() {
+        configurationRetryWorkItem?.cancel()
+        configurationRetryWorkItem = nil
+        configurationRetryAttempts = 0 // a replaced peripheral/delegate starts with a fresh retry budget
     }
 
     private func assertConfiguration() {
         log.debug("assertConfiguration")
-        perform { (_) in
+        // This empty probe only triggers configuration; it must NOT arm the fail-closed retry (see
+        // configureAndRun) — a no-op retry could otherwise block a real operation's retry.
+        perform(retryOnConfigFailure: false) { (_) in
             // Intentionally empty to trigger configuration if necessary
         }
     }
