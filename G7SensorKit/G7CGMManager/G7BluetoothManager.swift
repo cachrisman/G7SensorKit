@@ -120,6 +120,15 @@ class G7BluetoothManager: NSObject {
         }
     }
 
+    /// C-207-2: `true` once a real-time glucose message has been parsed on the current connection.
+    /// Reset to `false` when a connect is issued (`connectIfNotInFlight`); set to `true` by
+    /// `G7Sensor.handleGlucoseMessage`. A disconnect with this still `false` means the transmitter
+    /// dropped *before* delivering an EGV (pre-auth / pre-EGV) — it is likely still advertising, so
+    /// `scanAfterDelay()` rescans immediately instead of waiting the 2s post-EGV shutdown grace.
+    /// Isolated to `managerQueue` (written/read only on that queue: connect issue, glucose parse,
+    /// and the disconnect-path `scanAfterDelay`).
+    var receivedGlucoseSinceConnect: Bool = false
+
     // MARK: - Synchronization
 
     private let managerQueue = DispatchQueue(label: "com.loudnate.CGMBLEKit.bluetoothManagerQueue", qos: .unspecified)
@@ -242,9 +251,18 @@ class G7BluetoothManager: NSObject {
 
      */
     fileprivate func scanAfterDelay() {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        // C-207-2: the 2s grace lets the transmitter finish its normal between-reading shutdown AFTER
+        // it has delivered an EGV. But when the connection dropped BEFORE any glucose arrived this
+        // connection (pre-auth / pre-EGV remote disconnect — the dominant watch-background miss in
+        // build 206), the transmitter is likely still in its advertise/connection window; waiting 2s
+        // plus a full rescan can miss it and lose the reading. Rescan immediately in that case. Read
+        // the flag here (on `managerQueue`) before hopping to the utility queue.
+        let settleDelay: TimeInterval = receivedGlucoseSinceConnect ? 2 : 0
         DispatchQueue.global(qos: .utility).async {
-            Thread.sleep(forTimeInterval: 2)
-
+            if settleDelay > 0 {
+                Thread.sleep(forTimeInterval: settleDelay)
+            }
             self.scanForPeripheral()
         }
     }
@@ -285,6 +303,8 @@ class G7BluetoothManager: NSObject {
             )
             return
         }
+        // C-207-2: a fresh connect attempt opens a new "did this connection deliver an EGV?" window.
+        receivedGlucoseSinceConnect = false
         centralManager.connect(peripheral)
     }
 
@@ -358,7 +378,13 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
 
-        if let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] {
+        let restoredPeripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]
+        // M2: make CB state restoration observable in telemetry. `willRestoreState` previously logged
+        // only via OSLog (invisible to BetterStack), so whether watchOS ever relaunches us for BLE was
+        // unmeasurable. Emit a structured event so the entitlement question (P1) can be answered from data.
+        emitG7Telemetry("will_restore_state", "restored_peripherals=\(restoredPeripherals?.count ?? 0)")
+
+        if let peripherals = restoredPeripherals {
             for peripheral in peripherals {
                 log.default("Restoring peripheral from state: %{public}@", peripheral.identifier.uuidString)
                 handleDiscoveredPeripheral(peripheral)

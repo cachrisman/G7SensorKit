@@ -136,6 +136,11 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             "egv_received",
             "glucose=\(glucoseStr) sequence=\(message.sequence) algorithm_state=\(message.algorithmState.rawValue) age_s=\(message.age) message_timestamp=\(message.messageTimestamp) trend_rate=\(trendStr) display_only=\(message.glucoseIsDisplayOnly)"
         )
+        // C-207-2: this connection delivered a real-time EGV, so a subsequent disconnect is the
+        // transmitter's normal post-reading shutdown — `scanAfterDelay` should keep its 2s grace.
+        // (A disconnect with this flag still false ⇒ pre-EGV drop ⇒ immediate rescan.) Runs on
+        // `managerQueue`, the same queue `scanAfterDelay` reads the flag on.
+        bluetoothManager.receivedGlucoseSinceConnect = true
         activationDate = Date().addingTimeInterval(-TimeInterval(message.messageTimestamp))
         peripheralManager.perform { (peripheral) in
             self.log.debug("Listening for backfill responses")
