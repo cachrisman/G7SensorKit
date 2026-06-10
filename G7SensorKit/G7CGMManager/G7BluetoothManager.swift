@@ -195,10 +195,14 @@ class G7BluetoothManager: NSObject {
             // following a sensor — the dominant state. For a bound sensor this routes through
             // `.makeActive` → `connectIfNotInFlight`, which is a no-op nudge when a pending
             // connect already exists; the value is the wake + observability.
-            guard event == .peerConnected else { return }
+            // Verification finding: preserve the pre-208 discovery-mode behavior — when
+            // unbound, ANY connection event (incl. `.peerDisconnected`, i.e. another app just
+            // released the sensor's system connection) triggered discovery handling. For the
+            // bound case (new in 208), only `.peerConnected` attaches.
+            guard event == .peerConnected || self.activePeripheralIdentifier == nil else { return }
             emitG7Telemetry(
                 "connection_event",
-                "peripheral=\(peripheral.identifier.uuidString) bound=\(self.activePeripheralIdentifier != nil)"
+                "event=\(event.rawValue) peripheral=\(peripheral.identifier.uuidString) bound=\(self.activePeripheralIdentifier != nil)"
             )
             self.log.default("Peripheral from connectionEventDidOccur %{public}@", peripheral.identifier.uuidString)
             self.handleDiscoveredPeripheral(peripheral)

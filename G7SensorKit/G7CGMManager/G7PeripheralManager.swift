@@ -41,7 +41,12 @@ class G7PeripheralManager: NSObject {
             // THIS queue while waiting for a CBPeripheralDelegate callback that only
             // `managerQueue` can deliver — a lock-order inversion resolved only by the ~2s
             // command timeout, freezing the BLE delegate queue inside the connect window.
-            // A briefly-stale `needsConfiguration` is C3-protected (fail-closed + bounded retry).
+            // Stale-window coverage (verification-corrected): a block already queued at
+            // re-assign time can run before this async lands, seeing `needsConfiguration ==
+            // false` against the NEW peripheral. Protection there is `configureAndRun`'s
+            // read-site check (`peripheral.services == nil` forces reconfiguration for a fresh
+            // instance) plus characteristic lookups throwing `.unknownCharacteristic` for the
+            // cached-services residual — C3's retry covers the skip-on-config-failure case only.
             queue.async {
                 self.needsConfiguration = true
                 self.cancelConfigurationRetry() // C3: stale peripheral — drop the pending retry block
@@ -212,6 +217,12 @@ extension G7PeripheralManager {
                     "configure_retry_exhausted",
                     "attempts=\(self.configurationRetryAttempts) action=disconnect"
                 )
+                // C-208-11 (verification finding): reset the budget when escalating. The
+                // stored_id re-attach returns the SAME CBPeripheral instance, so the
+                // `peripheral` didSet (identity-guarded) never resets it — without this line,
+                // every post-exhaustion reconnection's first config failure would instantly
+                // re-disconnect with no retry ladder.
+                self.configurationRetryAttempts = 0
                 self.central?.cancelPeripheralConnection(self.peripheral)
                 return
             }
