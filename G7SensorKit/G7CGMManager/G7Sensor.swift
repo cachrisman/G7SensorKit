@@ -12,9 +12,32 @@ import HealthKit
 import os.log
 
 
+/// Delegate for `G7Sensor` events.
+///
+/// **Queue contract (C-208-17):** every callback is invoked on `G7Sensor`'s private serial
+/// `delegateQueue` — NOT the main thread, and NOT the internal Bluetooth `managerQueue`.
+/// Implementations must hop to their own isolation context; do not block this queue.
 public protocol G7SensorDelegate: AnyObject {
+    /// Fired when a *followed* sensor's peripheral becomes ready (auth subscription armed).
+    ///
+    /// **Not guaranteed on first discovery (C-208-17):** when no sensor is being followed yet
+    /// (`sensorID == nil` at readied time), the first-discovery cycle accepts the sensor inside
+    /// the glucose-message handler and delivers `didRead` directly — this callback never fires
+    /// for that session. Consumers keying session bookkeeping off this callback must also treat
+    /// a `didRead` with no preceding connect as an implicit connect (see Trio's
+    /// `G7WatchSensorAdapter` first-read bootstrap).
     func sensorDidConnect(_ sensor: G7Sensor, name: String)
 
+    /// Fired when the followed sensor's connection ends.
+    ///
+    /// **`suspectedEndOfSession` is a heuristic, not a session-end signal (C-208-17):** it means
+    /// "remote disconnect while authentication was still pending" (`pendingAuth &&
+    /// wasRemoteDisconnect`). On a consumer with long-lived authenticated connections (iPhone)
+    /// that pattern is rare and meaningful. On a passive observer with a per-window
+    /// connect/auth/read/disconnect cadence (watch) it misfires on routine reconnects —
+    /// measured 111/112 false-positive in build 205. Do NOT take destructive action (e.g.
+    /// forgetting the sensor / rescanning for new) on this flag alone; corroborate with
+    /// algorithm state or sensor age.
     func sensorDisconnected(_ sensor: G7Sensor, suspectedEndOfSession: Bool)
 
     func sensor(_ sensor: G7Sensor, didError error: Error)
@@ -25,7 +48,12 @@ public protocol G7SensorDelegate: AnyObject {
 
     func sensor(_ sensor: G7Sensor, didReadBackfill backfill: [G7BackfillMessage])
 
-    // If this returns true, then start following this sensor
+    /// If this returns true, then start following this sensor.
+    ///
+    /// **Synchronous on `delegateQueue` (C-208-17):** the return value is consumed inline, so
+    /// implementations cannot hop to an actor/main queue to answer — they must use
+    /// synchronously-accessible state (e.g. `UserDefaults`). Keep it fast; the glucose message
+    /// that triggered discovery is processed on the same queue right after this returns.
     func sensor(_ sensor: G7Sensor, didDiscoverNewSensor name: String, activatedAt: Date) -> Bool
 
     func sensor(_ sensor: G7Sensor, didReceive extendedVersion: ExtendedVersionMessage)
@@ -70,19 +98,39 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
     public weak var delegate: G7SensorDelegate?
 
-    // MARK: - Passive observation state, confined to `bluetoothManager.managerQueue`
+    // MARK: - Passive observation state
+    // C-208-13: this state was historically documented as "confined to managerQueue" but was in
+    // fact written from three different queues (managerQueue, delegateQueue, the peripheral
+    // queue) and read cross-queue by consumers — unsynchronized data races. Now `Locked<>`-backed:
+    // every read sees the latest committed value at a defined point. Call sites are unchanged.
 
-    /// The initial activation date of the sensor
-    var activationDate: Date?
+    private let lockedActivationDate: Locked<Date?> = Locked(nil)
+    /// The initial activation date of the sensor. Thread-safe (written on managerQueue and the
+    /// discovery-accept path; read by consumers on `delegateQueue`, e.g. `G7CGMManager.didRead`).
+    var activationDate: Date? {
+        get { lockedActivationDate.value }
+        set { lockedActivationDate.value = newValue }
+    }
 
-    /// The initial activation date of the sensor
-    var needsVersionInfo: Bool = false
+    private let lockedNeedsVersionInfo = Locked(false)
+    /// Whether an ExtendedVersion request should be issued after the next EGV. Thread-safe
+    /// (set by consumers at init, cleared on `delegateQueue`, read on managerQueue).
+    var needsVersionInfo: Bool {
+        get { lockedNeedsVersionInfo.value }
+        set { lockedNeedsVersionInfo.value = newValue }
+    }
 
     /// The date of last connection
     private var lastConnection: Date?
 
-    /// Used to detect connections that do not authenticate, signalling possible sensor switchover
-    private var pendingAuth: Bool = false
+    private let lockedPendingAuth = Locked(false)
+    /// Used to detect connections that do not authenticate, signalling possible sensor switchover.
+    /// Thread-safe (set on the peripheral queue inside `readied`'s perform block; cleared on
+    /// managerQueue in the auth-pass and disconnect paths).
+    private var pendingAuth: Bool {
+        get { lockedPendingAuth.value }
+        set { lockedPendingAuth.value = newValue }
+    }
 
     /// The backfill data buffer
     private var backfillBuffer: [G7BackfillMessage] = []
@@ -95,14 +143,23 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
     private let delegateQueue = DispatchQueue(label: "com.loopkit.G7Sensor.delegateQueue", qos: .unspecified)
 
-    private var sensorID: String?
+    private let lockedSensorID: Locked<String?>
+    /// Followed sensor name. Thread-safe (C-208-13): written from `scanForNewSensor()` (caller's
+    /// thread) and the discovery-accept path (`delegateQueue`); read on managerQueue in
+    /// `readied` / `shouldConnectPeripheral` / `peripheralDidDisconnect` / `handleGlucoseMessage`.
+    /// The historical race here meant managerQueue could issue broad `.connect`s after the
+    /// accept path had already bound a sensor — a day-1 discovery-path hazard.
+    private var sensorID: String? {
+        get { lockedSensorID.value }
+        set { lockedSensorID.value = newValue }
+    }
 
     private func emitG7TelemetrySensorLocked(_ name: String) {
         emitG7Telemetry("sensor_name_locked", "locked_name=\(name)")
     }
 
     public init(sensorID: String?) {
-        self.sensorID = sensorID
+        lockedSensorID = Locked(sensorID)
         bluetoothManager.delegate = self
     }
 

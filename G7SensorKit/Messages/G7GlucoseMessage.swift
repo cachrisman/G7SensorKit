@@ -98,6 +98,13 @@ public struct G7GlucoseMessage: SensorMessage, Equatable {
 
         age = data[10..<12].to(UInt16.self)
 
+        // C-208-18: reject rather than trap. `glucoseTimestamp` computes
+        // `messageTimestamp - age` on unsigned integers; a corrupt packet with
+        // age > messageTimestamp would crash on underflow in the BLE hot path.
+        guard messageTimestamp >= UInt32(age) else {
+            return nil
+        }
+
         let glucoseData = data[12..<14].to(UInt16.self)
         if glucoseData != 0xffff {
             glucose = glucoseData & 0xfff

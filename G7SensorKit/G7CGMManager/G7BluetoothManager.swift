@@ -189,10 +189,19 @@ class G7BluetoothManager: NSObject {
 
     func centralManager(_ central: CBCentralManager, connectionEventDidOccur event: CBConnectionEvent, for peripheral: CBPeripheral) {
         managerQueue.async {
-            if self.activePeripheralIdentifier == nil {
-                self.log.default("Discovered peripheral from connectionEventDidOccur %{public}@", peripheral.identifier.uuidString)
-                self.handleDiscoveredPeripheral(peripheral)
-            }
+            // C-208-16b: handle `.peerConnected` for the BOUND peripheral too. This was
+            // previously gated to discovery mode (`activePeripheralIdentifier == nil`), so the
+            // system-level "the G7 just connected on this device" wake was dropped exactly when
+            // following a sensor — the dominant state. For a bound sensor this routes through
+            // `.makeActive` → `connectIfNotInFlight`, which is a no-op nudge when a pending
+            // connect already exists; the value is the wake + observability.
+            guard event == .peerConnected else { return }
+            emitG7Telemetry(
+                "connection_event",
+                "peripheral=\(peripheral.identifier.uuidString) bound=\(self.activePeripheralIdentifier != nil)"
+            )
+            self.log.default("Peripheral from connectionEventDidOccur %{public}@", peripheral.identifier.uuidString)
+            self.handleDiscoveredPeripheral(peripheral)
         }
     }
 
@@ -259,6 +268,9 @@ class G7BluetoothManager: NSObject {
         // plus a full rescan can miss it and lose the reading. Rescan immediately in that case. Read
         // the flag here (on `managerQueue`) before hopping to the utility queue.
         let settleDelay: TimeInterval = receivedGlucoseSinceConnect ? 2 : 0
+        // C-208-15: observability only — makes the self-initiated rescan visible in telemetry
+        // (it was previously inferable only from its consequences). No control-flow change.
+        emitG7Telemetry("rescan_scheduled", "delay_s=\(Int(settleDelay)) had_glucose=\(receivedGlucoseSinceConnect)")
         DispatchQueue.global(qos: .utility).async {
             if settleDelay > 0 {
                 Thread.sleep(forTimeInterval: settleDelay)
@@ -363,6 +375,17 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
         switch central.state {
         case .poweredOn:
+            // C-208-16a: register for connection events at every poweredOn, not only inside the
+            // scan branch of `managerQueue_scanForPeripheral`. The bound steady-state attaches
+            // via stored_id (pending connect, no scan — 95–97% of attaches in telemetry), so
+            // scan-branch-only registration left connection events unregistered for most of the
+            // process lifetime. Registration dies with the process (build-190 lesson) — this is
+            // the per-process re-arm site. Re-registering later in the scan branch is harmless
+            // (the OS replaces the prior registration).
+            central.registerForConnectionEvents(options: [CBConnectionEventMatchingOption.serviceUUIDs: [
+                SensorServiceUUID.advertisement.cbUUID,
+                SensorServiceUUID.cgmService.cbUUID
+            ]])
             managerQueue_scanForPeripheral()
         case .resetting, .poweredOff, .unauthorized, .unknown, .unsupported:
             fallthrough

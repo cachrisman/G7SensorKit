@@ -26,9 +26,18 @@ public struct G7TelemetryPayload: Sendable {
 }
 
 public enum G7Telemetry {
+    /// C-208-14: lock-backed storage. The host assigns `emit` at startup on the main thread
+    /// while BLE queues may already be emitting (the central can exist before the assignment
+    /// lands) — an unsynchronized static var here is a data race.
+    private static let lockedEmit: Locked<((G7TelemetryPayload) -> Void)?> = Locked(nil)
+
     /// Set by the host app at startup. When nil, all emissions are no-ops.
     /// Receives structured payload; host formats `module=g7_core sensor_name=… event=… … g7_session=…`.
-    public static var emit: ((G7TelemetryPayload) -> Void)?
+    /// Thread-safe; intended as set-once-at-launch.
+    public static var emit: ((G7TelemetryPayload) -> Void)? {
+        get { lockedEmit.value }
+        set { lockedEmit.value = newValue }
+    }
 
     /// Serial queue for async telemetry dispatch.
     fileprivate static let queue = DispatchQueue(

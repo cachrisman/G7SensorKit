@@ -36,7 +36,13 @@ class G7PeripheralManager: NSObject {
             oldValue.delegate = nil
             peripheral.delegate = self
 
-            queue.sync {
+            // C-208-12: async, never sync. This didSet runs on `managerQueue` (the `.makeActive`
+            // re-assign site); a `queue.sync` here can wedge against `runCommand`, which blocks
+            // THIS queue while waiting for a CBPeripheralDelegate callback that only
+            // `managerQueue` can deliver — a lock-order inversion resolved only by the ~2s
+            // command timeout, freezing the BLE delegate queue inside the connect window.
+            // A briefly-stale `needsConfiguration` is C3-protected (fail-closed + bounded retry).
+            queue.async {
                 self.needsConfiguration = true
                 self.cancelConfigurationRetry() // C3: stale peripheral — drop the pending retry block
             }
@@ -71,9 +77,11 @@ class G7PeripheralManager: NSObject {
 
     weak var delegate: G7PeripheralManagerDelegate? {
         didSet {
-            queue.sync {
-                needsConfiguration = true
-                cancelConfigurationRetry() // C3
+            // C-208-12: async for the same lock-order-inversion reason as the `peripheral`
+            // didSet above (this setter is also reached from `managerQueue`).
+            queue.async {
+                self.needsConfiguration = true
+                self.cancelConfigurationRetry() // C3
             }
         }
     }
@@ -193,7 +201,18 @@ extension G7PeripheralManager {
                 return
             }
             guard self.configurationRetryAttempts < self.maxConfigurationRetryAttempts else {
-                emitG7Telemetry("configure_retry_exhausted", "attempts=\(self.configurationRetryAttempts)")
+                // C-208-11: escalate at exhaustion instead of dead-ending. A connection whose
+                // configuration can never complete delivers no EGVs; holding it open blocks
+                // re-attach until the transmitter gives up (observed as ~600s zombie
+                // connections on builds 204/205). Drop it and let the normal disconnect path
+                // re-attach. Shared iPhone+watch; this state has never been reached in 30d of
+                // telemetry on either platform (configure_retry_exhausted = 0), so this is
+                // fail-safe insurance: it only acts where today's behavior is strictly worse.
+                emitG7Telemetry(
+                    "configure_retry_exhausted",
+                    "attempts=\(self.configurationRetryAttempts) action=disconnect"
+                )
+                self.central?.cancelPeripheralConnection(self.peripheral)
                 return
             }
             self.needsConfiguration = true
