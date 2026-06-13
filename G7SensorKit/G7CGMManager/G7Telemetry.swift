@@ -55,3 +55,17 @@ internal func emitG7Telemetry(_ event: String, _ fields: String = "") {
         emit(payload)
     }
 }
+
+/// C-209-11: host-set background hint. When the host app (e.g. Trio watch) is backgrounded, the
+/// library skips non-essential GATT round-trips (backfill subscription, extended-version request)
+/// that add radio time inside a constrained background runtime slice without helping the current
+/// reading. Scene phase isn't visible to the library, so the host sets this. Thread-safe (read on
+/// BLE queues, written from the host's main thread). Default `false` — hosts that never set it
+/// (Loop, the iOS phone path) see no behavior change.
+public enum G7BackgroundHints {
+    private static let lockedBackgrounded = Locked<Bool>(false)
+    public static var isHostBackgrounded: Bool {
+        get { lockedBackgrounded.value }
+        set { lockedBackgrounded.value = newValue }
+    }
+}

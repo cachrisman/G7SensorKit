@@ -199,26 +199,36 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         // `managerQueue`, the same queue `scanAfterDelay` reads the flag on.
         bluetoothManager.receivedGlucoseSinceConnect = true
         activationDate = Date().addingTimeInterval(-TimeInterval(message.messageTimestamp))
-        peripheralManager.perform { (peripheral) in
-            self.log.debug("Listening for backfill responses")
-            // Subscribe to backfill updates
-            do {
-                try peripheral.listenToCharacteristic(.backfill)
-            } catch let error {
-                emitG7Telemetry("backfill_notify_failed", "error=\(error.localizedDescription)")
-                self.log.error("Error trying to enable notifications on backfill characteristic: %{public}@", String(describing: error))
-                self.delegateQueue.async {
-                    self.delegate?.sensor(self, didError: error)
+        // C-209-11: skip the non-essential GATT round-trips while the host is backgrounded. The
+        // current EGV already arrived; the backfill subscription and extended-version request only
+        // add radio time inside a constrained background runtime slice. Foreground / iOS behavior
+        // is unchanged (the hint defaults to false). needsVersionInfo stays true if skipped, so the
+        // one-time version fetch simply happens on the next foreground connection.
+        let skipBackgroundGATT = G7BackgroundHints.isHostBackgrounded
+        if skipBackgroundGATT {
+            emitG7Telemetry("background_gatt_skipped", "backfill_subscribe=true extended_version_pending=\(needsVersionInfo)")
+        } else {
+            peripheralManager.perform { (peripheral) in
+                self.log.debug("Listening for backfill responses")
+                // Subscribe to backfill updates
+                do {
+                    try peripheral.listenToCharacteristic(.backfill)
+                } catch let error {
+                    emitG7Telemetry("backfill_notify_failed", "error=\(error.localizedDescription)")
+                    self.log.error("Error trying to enable notifications on backfill characteristic: %{public}@", String(describing: error))
+                    self.delegateQueue.async {
+                        self.delegate?.sensor(self, didError: error)
+                    }
                 }
             }
-        }
 
-        if needsVersionInfo, let name = peripheralManager.peripheral.name, name == sensorID {
-            peripheralManager.perform { (peripheral) in
-                do {
-                    try peripheral.requestExtendedVersion()
-                } catch let error {
-                    self.log.error("Error trying to request extended version: %{public}@", String(describing: error))
+            if needsVersionInfo, let name = peripheralManager.peripheral.name, name == sensorID {
+                peripheralManager.perform { (peripheral) in
+                    do {
+                        try peripheral.requestExtendedVersion()
+                    } catch let error {
+                        self.log.error("Error trying to request extended version: %{public}@", String(describing: error))
+                    }
                 }
             }
         }
