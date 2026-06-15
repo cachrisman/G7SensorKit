@@ -13,19 +13,18 @@ extension Data {
     private func toDefaultEndian<T: FixedWidthInteger>(_: T.Type) -> T {
         // C-209-12 (review 1.5): length-checked. The previous `bufferPointer.pointee` read
         // `MemoryLayout<T>.size` bytes unconditionally, so a slice shorter than T (e.g. a 3-byte
-        // slice read as UInt32) read past the buffer end — a latent out-of-bounds read. Copy the
-        // available bytes into a zero-initialized stack value: a short slice can never over-read,
-        // and for a correctly sized slice the in-memory result is byte-identical to the old read
-        // (so `to`/`toBigEndian` are unchanged on valid input).
+        // slice read as UInt32) read past the buffer end — a latent out-of-bounds read. Build the
+        // native-endian value from the available bytes instead: a short slice zero-pads rather than
+        // over-reading, and for a correctly sized slice the result is byte-identical to the old read
+        // (so `to`/`toBigEndian` are unchanged on valid input). Pointer-free by design — the prior
+        // `withUnsafeMutableBytes(of:)` form crashed the Swift 6 compiler ("failed to produce
+        // diagnostic for expression") on this generic.
+        let n = Swift.min(MemoryLayout<T>.size, self.count)
         var value: T = 0
-        withUnsafeMutableBytes(of: &value) { dest in
-            self.withUnsafeBytes { src in
-                guard let base = src.baseAddress else { return }
-                let n = Swift.min(dest.count, src.count)
-                if n > 0 {
-                    dest.copyMemory(from: UnsafeRawBufferPointer(start: base, count: n))
-                }
-            }
+        var shift = 0
+        for i in 0 ..< n {
+            value |= T(truncatingIfNeeded: self[self.startIndex + i]) << shift
+            shift += 8
         }
         return value
     }
