@@ -450,6 +450,16 @@ class G7BluetoothManager: NSObject {
     /// `lastRekickAt` debounce bounds how often this can fire — so a persistent stall cannot storm.
     private func rekickBoundStalledPeripheral(_ peripheral: CBPeripheral) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
+        // review round 4 (codex Medium): the connection-event peripheral can be a FRESH CBPeripheral
+        // object for the active UUID while the manager still holds a stale one. Cancelling the event
+        // object directly would then trip `peripheral != activePeripheral` in didDisconnect and drop
+        // the active map entry, blunting recovery. Adopt the event object as the active peripheral
+        // first, so we cancel the object the manager and CoreBluetooth agree on and didDisconnect
+        // keeps the binding's map entry. (Same UUID, so no binding change / no generation bump.)
+        if activePeripheralManager?.peripheral !== peripheral {
+            activePeripheralManager?.peripheral = peripheral
+            lockedPeripheralIdentifier.value = peripheral.identifier
+        }
         bindingState.lastRekickAt = Date()
         let stallAge = bindingState.lastGlucoseAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
         let connAge = bindingState.currentConnectionStartedAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
@@ -463,6 +473,10 @@ class G7BluetoothManager: NSObject {
 
     /// C-210-7 (review/codex Blocker): queue a single drain-time retry for a gated connect, so a
     /// bound-but-disconnected peripheral isn't left idle until an unrelated event happens to re-attempt.
+    /// ACCEPTED LIMITATION (review finding E): the retry resolves the *active* binding, so a connect
+    /// gated during UNBOUND new-sensor discovery (activePeripheralIdentifier == nil) is not re-fired
+    /// here — rediscovery / the next scan covers it once the window drains. Discovery-scoped pairing
+    /// latency only, not a bound-steady-state gap; tracked as a soak follow-up.
     private func scheduleGatedConnectRetry(_ peripheral: CBPeripheral) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
         guard !bindingState.gatedRetryScheduled else { return }
