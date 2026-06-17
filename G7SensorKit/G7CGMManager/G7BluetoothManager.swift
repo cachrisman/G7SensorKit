@@ -129,6 +129,25 @@ class G7BluetoothManager: NSObject {
     /// and the disconnect-path `scanAfterDelay`).
     var receivedGlucoseSinceConnect: Bool = false
 
+    /// C-210-6: wall-clock of the last real-time EGV parsed on the active binding, set alongside
+    /// `receivedGlucoseSinceConnect` in `G7Sensor.handleGlucoseMessage`. Unlike that per-connection
+    /// flag this persists across reconnects, so a "bound but stalled" condition (no EGV for longer
+    /// than a reading cycle) is detectable. managerQueue-isolated (written on glucose parse, read in
+    /// `connectionEventDidOccur`).
+    var lastGlucoseAt: Date?
+
+    /// C-210-7: sliding window of issued-connect timestamps for the reconnect-storm throttle.
+    /// managerQueue-isolated (only `connectIfNotInFlight` touches it).
+    private var recentConnectIssueTimes: [Date] = []
+    private static let connectGateWindow: TimeInterval = 300 // 5 min
+    /// Normal cadence is ~1 connect / 5-min reading; allow a few recovery retries, gate true storms
+    /// (the 208/209 soak saw up to 16 did_connect in a 5-min window).
+    private static let connectGateMaxPerWindow = 8
+
+    /// C-210-6: a bound peripheral with no EGV for longer than this is "stalled" — a connection event
+    /// then signals a fresh sensor window worth re-attaching to. > 2 missed 5-min cycles.
+    private static let rekickStallThreshold: TimeInterval = 12 * 60
+
     // MARK: - Synchronization
 
     private let managerQueue = DispatchQueue(label: "com.loudnate.CGMBLEKit.bluetoothManagerQueue", qos: .unspecified)
@@ -205,6 +224,17 @@ class G7BluetoothManager: NSObject {
                 "event=\(event.rawValue) peripheral=\(peripheral.identifier.uuidString) bound=\(self.activePeripheralIdentifier != nil)"
             )
             self.log.default("Peripheral from connectionEventDidOccur %{public}@", peripheral.identifier.uuidString)
+            // C-210-6: bound-but-stalled re-kick. If we are bound to THIS sensor but it has gone
+            // stalled (no EGV past `rekickStallThreshold`), a connection event means the sensor just
+            // opened a fresh window. The normal `handleDiscoveredPeripheral` -> `connectIfNotInFlight`
+            // path no-ops when the CB connection still looks alive, so force a re-attach to ride the
+            // window now instead of waiting on the host's own timer. HARD-GATED to the stalled case:
+            // re-kicking while healthy would tear down a live connection on every event and feed the
+            // reconnect storm the C-210-7 gate exists to suppress.
+            if self.shouldRekickBoundStalled(for: peripheral) {
+                self.rekickBoundStalledPeripheral(peripheral)
+                return
+            }
             self.handleDiscoveredPeripheral(peripheral)
         }
     }
@@ -319,9 +349,53 @@ class G7BluetoothManager: NSObject {
             )
             return
         }
+        // C-210-7: connect-gate. Throttle reconnect STORMS (208/209 soak saw up to 16 did_connect in a
+        // 5-min window) without blocking normal cadence (~1 connect/reading) or a few recovery retries.
+        // Slide a 5-min window; beyond the cap, skip + log. Fail-safe: this can only REDUCE connects,
+        // never add one — a later discovery / scan / disconnect re-invokes this once the window drains.
+        let now = Date()
+        recentConnectIssueTimes = recentConnectIssueTimes.filter { now.timeIntervalSince($0) < Self.connectGateWindow }
+        guard recentConnectIssueTimes.count < Self.connectGateMaxPerWindow else {
+            emitG7Telemetry(
+                "connect_gated",
+                "reason=rate_limit window_s=\(Int(Self.connectGateWindow)) recent_connects=\(recentConnectIssueTimes.count) peripheral=\(peripheral.identifier.uuidString)"
+            )
+            return
+        }
+        recentConnectIssueTimes.append(now)
         // C-207-2: a fresh connect attempt opens a new "did this connection deliver an EGV?" window.
         receivedGlucoseSinceConnect = false
         centralManager.connect(peripheral)
+    }
+
+    /// C-210-6: true iff we are bound to `peripheral` and it has been stalled (no EGV) past the
+    /// threshold. False when unbound, bound to a different peripheral, or no EGV has ever been seen on
+    /// this binding (let the normal attach path handle a cold start).
+    private func shouldRekickBoundStalled(for peripheral: CBPeripheral) -> Bool {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        guard let activeID = activePeripheralIdentifier, activeID == peripheral.identifier else { return false }
+        guard let last = lastGlucoseAt else { return false }
+        return Date().timeIntervalSince(last) > Self.rekickStallThreshold
+    }
+
+    /// C-210-6: force a fresh attach onto a bound-but-stalled peripheral. Cancelling the apparently
+    /// live but EGV-silent connection drives the existing disconnect -> `scanAfterDelay` -> rescan
+    /// path (immediate rescan, since no glucose arrived this connection), which reconnects onto the
+    /// window the connection event signalled. The resulting reconnect is still subject to the
+    /// C-210-7 connect-gate, so a persistent stall cannot storm.
+    private func rekickBoundStalledPeripheral(_ peripheral: CBPeripheral) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        let stallAge = lastGlucoseAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
+        emitG7Telemetry(
+            "connection_event_rekick",
+            "peripheral=\(peripheral.identifier.uuidString) stall_age_s=\(stallAge) state=\(peripheral.state.rawValue)"
+        )
+        if peripheral.state == .connected || peripheral.state == .connecting {
+            receivedGlucoseSinceConnect = false
+            centralManager.cancelPeripheralConnection(peripheral)
+        } else {
+            connectIfNotInFlight(peripheral)
+        }
     }
 
     private func handleDiscoveredPeripheral(_ peripheral: CBPeripheral) {

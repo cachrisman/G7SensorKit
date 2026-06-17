@@ -198,6 +198,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         // (A disconnect with this flag still false ⇒ pre-EGV drop ⇒ immediate rescan.) Runs on
         // `managerQueue`, the same queue `scanAfterDelay` reads the flag on.
         bluetoothManager.receivedGlucoseSinceConnect = true
+        bluetoothManager.lastGlucoseAt = Date() // C-210-6: persists across reconnects for stall detection
         activationDate = Date().addingTimeInterval(-TimeInterval(message.messageTimestamp))
         // C-209-11: skip the non-essential GATT round-trips while the host is backgrounded. The
         // current EGV already arrived; the backfill subscription and extended-version request only
