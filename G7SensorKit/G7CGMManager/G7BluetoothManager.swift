@@ -129,11 +129,14 @@ class G7BluetoothManager: NSObject {
     /// and the disconnect-path `scanAfterDelay`).
     var receivedGlucoseSinceConnect: Bool = false
 
-    /// C-210-6/7: ALL binding-scoped BLE recovery state, reset atomically on every binding change
-    /// (`forgetPeripheral`). Consolidated into one object — rather than separate fields cleared at each
-    /// transition site — so "no stale stall/throttle/connection state across a sensor swap or restore"
-    /// is structural, not a per-transition checklist (review round 2: the A/B/C/D/H findings were all
-    /// missed transitions). managerQueue-isolated.
+    /// C-210-6/7: the binding-scoped BLE recovery state, reset atomically on every binding change
+    /// (`forgetPeripheral`, and a `.makeActive` re-bind to a new peripheral). Consolidated into one
+    /// object — rather than separate fields cleared at each transition site — so "no stale
+    /// stall/throttle/connection state across a sensor swap or restore" is structural, not a
+    /// per-transition checklist (review round 2: A/B/C/D/H were all missed transitions). NOTE:
+    /// `receivedGlucoseSinceConnect` is intentionally NOT in here — it is connection-scoped (reset on
+    /// every connect issue), not binding-scoped; it is reset alongside this struct in
+    /// `forgetPeripheral` for completeness. managerQueue-isolated.
     private struct BindingBLEState {
         /// Wall-clock of the last real-time EGV on this binding (persists across reconnects).
         var lastGlucoseAt: Date?
@@ -199,10 +202,12 @@ class G7BluetoothManager: NSObject {
     func forgetPeripheral() {
         managerQueue.sync {
             self.activePeripheralManager = nil
-            // C-210-6/7 (review A/B/C/D): binding reset (scanForNewSensor / EOS / session-end). Reset
-            // ALL recovery state in one shot and bump the generation so any in-flight delayed retry
-            // from the prior binding no-ops; drop stale managed peripherals so their late disconnect
-            // callbacks can't touch the new binding's connection state.
+            // C-210-6/7 (review A/B/C/D): binding reset. Reset binding-scoped recovery state in one
+            // shot and bump the generation so any in-flight delayed retry from the prior binding no-ops;
+            // drop stale managed peripherals so their late disconnect callbacks can't touch the new
+            // binding's connection state. Reached ONLY via scanForNewSensor (sensor swap / EOS /
+            // session-end), NOT from a normal disconnect(), so clearing managedPeripherals here does not
+            // skip a live-connection disconnect callback (review round 3, M-c).
             self.bindingState = BindingBLEState()
             self.bindingGeneration += 1
             self.managedPeripherals.removeAll()
@@ -421,8 +426,17 @@ class G7BluetoothManager: NSObject {
     private func shouldRekickBoundStalled(for peripheral: CBPeripheral) -> Bool {
         dispatchPrecondition(condition: .onQueue(managerQueue))
         guard let activeID = activePeripheralIdentifier, activeID == peripheral.identifier else { return false }
+        // M-b (review round 3, accepted limitation): re-kick requires an in-process EGV baseline
+        // (lastGlucoseAt non-nil). A nil clock after a cold launch / CB restore deliberately does NOT
+        // qualify — treating nil as "stalled" would re-kick during the ~27-min warmup (no EGVs,
+        // connection up past the zombie threshold). The fork has no warmup signal; cold-restore-into-
+        // stalled recovers via the watch adapter watchdog or the first EGV.
         guard let last = bindingState.lastGlucoseAt, Date().timeIntervalSince(last) > Self.rekickStallThreshold else { return false }
-        guard peripheral.state == .connected, !receivedGlucoseSinceConnect,
+        // review round 3 (High): do NOT also require a never-delivered-EGV flag — that would narrow the
+        // zombie to "this connection never delivered ANY EGV" and miss a connection that delivered one
+        // EGV then went silent. The connection-age guard already excludes a fresh attach, and the
+        // global-stall guard above already excludes a connection that is actually delivering.
+        guard peripheral.state == .connected,
               let connectedAt = bindingState.currentConnectionStartedAt,
               Date().timeIntervalSince(connectedAt) > Self.zombieConnectionThreshold else { return false }
         if let lastRekick = bindingState.lastRekickAt, Date().timeIntervalSince(lastRekick) < Self.rekickMinInterval { return false }
@@ -480,8 +494,21 @@ class G7BluetoothManager: NSObject {
             case .makeActive:
                 log.default("Making peripheral active: %{public}@", peripheral.identifier.uuidString)
 
+                // C-210-6 (review round 3, M-a / High#2): a re-bind to a DIFFERENT peripheral changes
+                // the binding WITHOUT going through forgetPeripheral. Reset binding-scoped recovery
+                // state + bump the generation so prior-binding stall/throttle/retry state can't leak in
+                // and a pending gated-retry closure no-ops. Steady-state reconnects (same id) skip this.
+                if activePeripheral?.identifier != peripheral.identifier {
+                    bindingState = BindingBLEState()
+                    bindingGeneration += 1
+                }
+
                 if let peripheralManager = activePeripheralManager {
                     peripheralManager.peripheral = peripheral
+                    // Swapping `.peripheral` on the existing manager does NOT fire the
+                    // activePeripheralManager didSet that maintains activePeripheralIdentifier, so set it
+                    // explicitly — otherwise the re-kick/retry guards compare against a stale UUID (M-a).
+                    lockedPeripheralIdentifier.value = peripheral.identifier
                 } else {
                     activePeripheralManager = G7PeripheralManager(
                         peripheral: peripheral,
