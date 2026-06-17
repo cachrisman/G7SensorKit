@@ -182,12 +182,6 @@
             "value" : "---"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "– – –"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -335,12 +329,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%1$@ יכול לקרוא נתונים מחיישן G7, אבל תצטרך להשתמש באפליקציית Dexcom G7 כדי לצמד, לכייל ולנהל את החיישן."
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%1$@ G7 सीजीएम की रीडिंग्स पढ़ सकता है लेकिन सीजीएम सेन्सर के मैनज्मेंट, सेन्सर पैरिंग और कैलिब्रेशन की लिए dexcom का G7 ऐप ही इस्तेमाल करना चाहिए।"
           }
         },
         "hu" : {
@@ -782,12 +770,6 @@
             "value" : "ביטול"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "निरस्त"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -845,7 +827,7 @@
         "ro" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Renunță"
+            "value" : "Anulați"
           }
         },
         "ru" : {
@@ -1639,12 +1621,6 @@
             "value" : "Dexcom G7"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Dexcom G7"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1936,12 +1912,6 @@
             "value" : "גלוקוז"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "शुगर"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2097,12 +2067,6 @@
             "value" : "סיום זמן חסד"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ग्रेस समय समाप्त"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2252,12 +2216,6 @@
             "value" : "זמן חסר שנשאר"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "बचा हुआ ग्रेस समय"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2401,12 +2359,6 @@
             "value" : "גבוה"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "HIGH"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2548,12 +2500,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "חיבור אחרון"
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "लास्ट  कनेक्ट"
           }
         },
         "hu" : {
@@ -2841,12 +2787,6 @@
             "value" : "נמוך"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "LOW"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2994,12 +2934,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "שם"
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "नाम"
           }
         },
         "hu" : {
@@ -3573,12 +3507,6 @@
             "value" : "מחפש\nחיישן"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर ढूँड रहा है"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3720,12 +3648,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "מחפש חיישן"
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर ढूँड रहा है"
           }
         },
         "hu" : {
@@ -3871,12 +3793,6 @@
             "value" : "החיישן\nפג"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर समाप्त"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4018,12 +3934,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "כשל\nבחיישן"
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर ख़राब"
           }
         },
         "hu" : {
@@ -4169,12 +4079,6 @@
             "value" : "בעייה\nבחיישן"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर ख़राबी"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4318,12 +4222,6 @@
             "value" : "חיישן\nבהכנה"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर का शुरुआती समय"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4465,12 +4363,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "תוקף חיישן"
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर समाप्ति"
           }
         },
         "hu" : {
@@ -4622,12 +4514,6 @@
             "value" : "החיישן פג"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर समाप्त हो गया"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4769,12 +4655,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "תוקף החיישן"
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर समाप्त"
           }
         },
         "hu" : {
@@ -4926,12 +4806,6 @@
             "value" : "החיישן נכשל"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर ख़राब हो गया है"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5073,12 +4947,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "התחלת חיישן"
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सेन्सर  शुरू"
           }
         },
         "hu" : {
@@ -5224,12 +5092,6 @@
             "value" : "האות\nאבד"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "सिग्नल लॉस"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5373,12 +5235,6 @@
             "value" : "שעה"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "समय"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5520,12 +5376,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "מגמה"
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ट्रेंड"
           }
         },
         "hu" : {
@@ -5677,12 +5527,6 @@
             "value" : "העלה קריאות"
           }
         },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "अपलोड रीडिंग्स"
-          }
-        },
         "hu" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5824,12 +5668,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "ההכנה הסתיימה"
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "शुरुआती वॉर्म अप पूर्ण"
           }
         },
         "hu" : {
