@@ -129,38 +129,50 @@ class G7BluetoothManager: NSObject {
     /// and the disconnect-path `scanAfterDelay`).
     var receivedGlucoseSinceConnect: Bool = false
 
-    /// C-210-6: wall-clock of the last real-time EGV parsed on the active binding, set alongside
-    /// `receivedGlucoseSinceConnect` in `G7Sensor.handleGlucoseMessage`. Unlike that per-connection
-    /// flag this persists across reconnects, so a "bound but stalled" condition (no EGV for longer
-    /// than a reading cycle) is detectable. managerQueue-isolated (written on glucose parse, read in
-    /// `connectionEventDidOccur`).
-    var lastGlucoseAt: Date?
+    /// C-210-6/7: ALL binding-scoped BLE recovery state, reset atomically on every binding change
+    /// (`forgetPeripheral`). Consolidated into one object — rather than separate fields cleared at each
+    /// transition site — so "no stale stall/throttle/connection state across a sensor swap or restore"
+    /// is structural, not a per-transition checklist (review round 2: the A/B/C/D/H findings were all
+    /// missed transitions). managerQueue-isolated.
+    private struct BindingBLEState {
+        /// Wall-clock of the last real-time EGV on this binding (persists across reconnects).
+        var lastGlucoseAt: Date?
+        /// Wall-clock the ACTIVE peripheral last became `.connected`. Set/cleared ONLY for the active
+        /// binding (review A/H) and seeded once on adopt-if-already-connected (review D). Drives the
+        /// "connected zombie" age check.
+        var currentConnectionStartedAt: Date?
+        /// Last re-kick time — debounce so the cancel path can't churn faster than the gate caps
+        /// reconnects (review H2).
+        var lastRekickAt: Date?
+        /// Sliding window of issued-connect timestamps for the reconnect-storm throttle (C-210-7).
+        var recentConnectIssueTimes: [Date] = []
+        /// True while a drain-time gated-connect retry is queued, so repeated gating doesn't stack.
+        var gatedRetryScheduled = false
+    }
+    private var bindingState = BindingBLEState()
+    /// Monotonic id bumped on every binding reset, captured by the delayed-retry closure so a stale
+    /// closure from a prior binding no-ops instead of clearing the NEW binding's retry flag (review B).
+    private var bindingGeneration = 0
 
-    /// C-210-7: sliding window of issued-connect timestamps for the reconnect-storm throttle.
-    /// managerQueue-isolated (only `connectIfNotInFlight` touches it).
-    private var recentConnectIssueTimes: [Date] = []
     private static let connectGateWindow: TimeInterval = 300 // 5 min
     /// Normal cadence is ~1 connect / 5-min reading; allow a few recovery retries, gate true storms
     /// (the 208/209 soak saw up to 16 did_connect in a 5-min window).
     private static let connectGateMaxPerWindow = 8
-
     /// C-210-6: a bound peripheral with no EGV for longer than this is "stalled" — a connection event
     /// then signals a fresh sensor window worth re-attaching to. > 2 missed 5-min cycles.
     private static let rekickStallThreshold: TimeInterval = 12 * 60
-
-    /// C-210-6 (review H1): wall-clock the active peripheral last became `.connected`; set in
-    /// `didConnect`, cleared on disconnect / fail. Lets the re-kick require a genuine "connected but
-    /// EGV-silent for a full cycle" zombie, so a fresh recovery attach is never cancelled.
-    private var currentConnectionStartedAt: Date?
     /// C-210-6 (review H1): a CONNECTED peripheral silent this long is a zombie (> one 5-min cycle).
     private static let zombieConnectionThreshold: TimeInterval = 6 * 60
-    /// C-210-6 (review H2): last re-kick time — debounce so the cancel path can't churn faster than
-    /// the connect-gate caps the reconnects. >= connectGateWindow.
-    private var lastRekickAt: Date?
+    /// C-210-6 (review H2): re-kick debounce; >= connectGateWindow.
     private static let rekickMinInterval: TimeInterval = 300
-    /// C-210-7 (review/codex Blocker): true while a drain-time gated-connect retry is already queued,
-    /// so repeated gating doesn't stack retries.
-    private var gatedRetryScheduled = false
+
+    /// Called on `managerQueue` from `G7Sensor.handleGlucoseMessage` when a real-time EGV is parsed:
+    /// marks this connection as having delivered glucose and stamps the binding-scoped last-EGV time.
+    func noteGlucoseReceived() {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        receivedGlucoseSinceConnect = true
+        bindingState.lastGlucoseAt = Date()
+    }
 
     // MARK: - Synchronization
 
@@ -187,13 +199,14 @@ class G7BluetoothManager: NSObject {
     func forgetPeripheral() {
         managerQueue.sync {
             self.activePeripheralManager = nil
-            // C-210-6/7 (review B1/M2): binding reset (incl. scanForNewSensor) drops stall / throttle /
-            // connection state so the next sensor is not re-kicked or gated by the prior binding.
-            self.lastGlucoseAt = nil
-            self.recentConnectIssueTimes.removeAll()
+            // C-210-6/7 (review A/B/C/D): binding reset (scanForNewSensor / EOS / session-end). Reset
+            // ALL recovery state in one shot and bump the generation so any in-flight delayed retry
+            // from the prior binding no-ops; drop stale managed peripherals so their late disconnect
+            // callbacks can't touch the new binding's connection state.
+            self.bindingState = BindingBLEState()
+            self.bindingGeneration += 1
+            self.managedPeripherals.removeAll()
             self.receivedGlucoseSinceConnect = false
-            self.currentConnectionStartedAt = nil
-            self.lastRekickAt = nil
         }
     }
 
@@ -368,6 +381,13 @@ class G7BluetoothManager: NSObject {
                 "connect_skipped",
                 "reason=in_flight peripheral=\(peripheral.identifier.uuidString) state=\(peripheral.state.rawValue)"
             )
+            // C-210-6 (review D): adopt an already-`.connected` ACTIVE binding (CB restore / retrieve)
+            // that skipped `didConnect`, so the zombie clock isn't permanently nil and re-kick can
+            // eventually qualify. Seed once, active binding only.
+            if peripheral.identifier == activePeripheralIdentifier, peripheral.state == .connected,
+               bindingState.currentConnectionStartedAt == nil {
+                bindingState.currentConnectionStartedAt = Date()
+            }
             return
         }
         // C-210-7: connect-gate. Throttle reconnect STORMS (208/209 soak saw up to 16 did_connect in a
@@ -375,11 +395,11 @@ class G7BluetoothManager: NSObject {
         // Slide a 5-min window; beyond the cap, skip + log. Fail-safe: this can only REDUCE connects,
         // never add one — a later discovery / scan / disconnect re-invokes this once the window drains.
         let now = Date()
-        recentConnectIssueTimes = recentConnectIssueTimes.filter { now.timeIntervalSince($0) < Self.connectGateWindow }
-        guard recentConnectIssueTimes.count < Self.connectGateMaxPerWindow else {
+        bindingState.recentConnectIssueTimes = bindingState.recentConnectIssueTimes.filter { now.timeIntervalSince($0) < Self.connectGateWindow }
+        guard bindingState.recentConnectIssueTimes.count < Self.connectGateMaxPerWindow else {
             emitG7Telemetry(
                 "connect_gated",
-                "reason=rate_limit window_s=\(Int(Self.connectGateWindow)) recent_connects=\(recentConnectIssueTimes.count) peripheral=\(peripheral.identifier.uuidString)"
+                "reason=rate_limit window_s=\(Int(Self.connectGateWindow)) recent_connects=\(bindingState.recentConnectIssueTimes.count) peripheral=\(peripheral.identifier.uuidString)"
             )
             // review/codex Blocker: a gated connect must NOT leave a bound-but-disconnected peripheral
             // idle (the bound scan path won't scan, and nothing else re-attempts). Queue one drain-time
@@ -387,7 +407,7 @@ class G7BluetoothManager: NSObject {
             scheduleGatedConnectRetry(peripheral)
             return
         }
-        recentConnectIssueTimes.append(now)
+        bindingState.recentConnectIssueTimes.append(now)
         // C-207-2: a fresh connect attempt opens a new "did this connection deliver an EGV?" window.
         receivedGlucoseSinceConnect = false
         centralManager.connect(peripheral)
@@ -401,11 +421,11 @@ class G7BluetoothManager: NSObject {
     private func shouldRekickBoundStalled(for peripheral: CBPeripheral) -> Bool {
         dispatchPrecondition(condition: .onQueue(managerQueue))
         guard let activeID = activePeripheralIdentifier, activeID == peripheral.identifier else { return false }
-        guard let last = lastGlucoseAt, Date().timeIntervalSince(last) > Self.rekickStallThreshold else { return false }
+        guard let last = bindingState.lastGlucoseAt, Date().timeIntervalSince(last) > Self.rekickStallThreshold else { return false }
         guard peripheral.state == .connected, !receivedGlucoseSinceConnect,
-              let connectedAt = currentConnectionStartedAt,
+              let connectedAt = bindingState.currentConnectionStartedAt,
               Date().timeIntervalSince(connectedAt) > Self.zombieConnectionThreshold else { return false }
-        if let lastRekick = lastRekickAt, Date().timeIntervalSince(lastRekick) < Self.rekickMinInterval { return false }
+        if let lastRekick = bindingState.lastRekickAt, Date().timeIntervalSince(lastRekick) < Self.rekickMinInterval { return false }
         return true
     }
 
@@ -416,9 +436,9 @@ class G7BluetoothManager: NSObject {
     /// `lastRekickAt` debounce bounds how often this can fire — so a persistent stall cannot storm.
     private func rekickBoundStalledPeripheral(_ peripheral: CBPeripheral) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
-        lastRekickAt = Date()
-        let stallAge = lastGlucoseAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
-        let connAge = currentConnectionStartedAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
+        bindingState.lastRekickAt = Date()
+        let stallAge = bindingState.lastGlucoseAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
+        let connAge = bindingState.currentConnectionStartedAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
         emitG7Telemetry(
             "connection_event_rekick",
             "peripheral=\(peripheral.identifier.uuidString) stall_age_s=\(stallAge) conn_age_s=\(connAge)"
@@ -431,16 +451,23 @@ class G7BluetoothManager: NSObject {
     /// bound-but-disconnected peripheral isn't left idle until an unrelated event happens to re-attempt.
     private func scheduleGatedConnectRetry(_ peripheral: CBPeripheral) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
-        guard !gatedRetryScheduled else { return }
-        gatedRetryScheduled = true
-        let oldest = recentConnectIssueTimes.min() ?? Date()
+        guard !bindingState.gatedRetryScheduled else { return }
+        bindingState.gatedRetryScheduled = true
+        let gen = bindingGeneration
+        let pid = peripheral.identifier
+        let oldest = bindingState.recentConnectIssueTimes.min() ?? Date()
         let drainIn = max(1, Self.connectGateWindow - Date().timeIntervalSince(oldest) + 1)
         managerQueue.asyncAfter(deadline: .now() + drainIn) { [weak self] in
             guard let self else { return }
-            self.gatedRetryScheduled = false
-            guard self.activePeripheralIdentifier == peripheral.identifier,
+            // review B: a stale closure from a prior binding must NOT clear the new binding's flag.
+            guard self.bindingGeneration == gen else { return }
+            self.bindingState.gatedRetryScheduled = false
+            // review F: resolve the current peripheral by identifier (the object can be replaced by a
+            // later retrieve/restore for the same UUID); only retry the still-active, disconnected binding.
+            guard self.activePeripheralIdentifier == pid, let peripheral = self.activePeripheral,
+                  peripheral.identifier == pid,
                   peripheral.state != .connected, peripheral.state != .connecting else { return }
-            self.emitG7Telemetry("connect_gate_retry", "peripheral=\(peripheral.identifier.uuidString)")
+            self.emitG7Telemetry("connect_gate_retry", "peripheral=\(pid.uuidString)")
             self.connectIfNotInFlight(peripheral)
         }
     }
@@ -553,7 +580,11 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
         emitG7Telemetry("did_connect", "peripheral=\(peripheral.identifier.uuidString)")
-        currentConnectionStartedAt = Date() // C-210-6: zombie-age baseline (review H1)
+        // C-210-6 (review H): zombie-age baseline — ACTIVE binding only, so a did_connect for a
+        // non-active managed peripheral can't refresh the active zombie's connection clock.
+        if peripheral.identifier == activePeripheralIdentifier {
+            bindingState.currentConnectionStartedAt = Date()
+        }
 
         log.default("%{public}@: %{public}@", #function, peripheral)
 
@@ -570,7 +601,11 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
-        currentConnectionStartedAt = nil // C-210-6: connection ended (review H1)
+        // C-210-6 (review A): clear the connection clock only when the ACTIVE binding disconnects, so
+        // a stray non-active peripheral's disconnect can't suppress re-kick for the active zombie.
+        if peripheral.identifier == activePeripheralIdentifier {
+            bindingState.currentConnectionStartedAt = nil
+        }
         log.default("%{public}@: %{public}@", #function, peripheral)
         // Ignore errors indicating the peripheral disconnected remotely, as that's expected behavior
         if let error = error as NSError?, CBError(_nsError: error).code != .peripheralDisconnected {
@@ -599,7 +634,10 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
-        currentConnectionStartedAt = nil // C-210-6: no live connection (review H1)
+        // C-210-6 (review A): active binding only (see didDisconnect).
+        if peripheral.identifier == activePeripheralIdentifier {
+            bindingState.currentConnectionStartedAt = nil
+        }
         emitG7Telemetry(
             "did_fail_to_connect",
             "peripheral=\(peripheral.identifier.uuidString) error=\(error?.localizedDescription ?? "nil")"
