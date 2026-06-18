@@ -495,7 +495,7 @@ class G7BluetoothManager: NSObject {
             guard self.activePeripheralIdentifier == pid, let peripheral = self.activePeripheral,
                   peripheral.identifier == pid,
                   peripheral.state != .connected, peripheral.state != .connecting else { return }
-            self.emitG7Telemetry("connect_gate_retry", "peripheral=\(pid.uuidString)")
+            emitG7Telemetry("connect_gate_retry", "peripheral=\(pid.uuidString)")
             self.connectIfNotInFlight(peripheral)
         }
     }
