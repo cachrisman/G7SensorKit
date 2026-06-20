@@ -144,6 +144,14 @@ class G7BluetoothManager: NSObject {
         /// binding (review A/H) and seeded once on adopt-if-already-connected (review D). Drives the
         /// "connected zombie" age check.
         var currentConnectionStartedAt: Date?
+        /// C-212-1: wall-clock the active binding's current connect attempt was issued while it is
+        /// still `.connecting`. Set on connect issue; thereafter owned by the connect watchdog
+        /// (`scheduleConnectTimeout`), which clears it once the attempt resolves on a `.connected` tick.
+        /// Also cleared by an explicit `disconnect()` and by binding resets. Deliberately NOT cleared by
+        /// didConnect/didDisconnect/didFailToConnect — a belated callback from a cancelled attempt would
+        /// otherwise disarm a newer attempt's watchdog (review). Drives the connect-attempt timeout that
+        /// breaks a wedged `.connecting` peripheral (`connect()` has no timeout). Active binding only.
+        var connectIssuedAt: Date?
         /// Last re-kick time — debounce so the cancel path can't churn faster than the gate caps
         /// reconnects (review H2).
         var lastRekickAt: Date?
@@ -168,6 +176,12 @@ class G7BluetoothManager: NSObject {
     private static let zombieConnectionThreshold: TimeInterval = 6 * 60
     /// C-210-6 (review H2): re-kick debounce; >= connectGateWindow.
     private static let rekickMinInterval: TimeInterval = 300
+    /// C-212-1: a connect attempt that never reaches `.connected` (and never fails) wedges the
+    /// peripheral in `.connecting` forever — `connect()` has no timeout — and every later
+    /// connectIfNotInFlight is skipped as in_flight (the build-211 multi-hour stall). Generous vs a
+    /// healthy connect (< a few seconds), under the 5-min cadence so a slow-but-progressing connect
+    /// is not killed and a hang costs at most one cycle.
+    private static let connectAttemptTimeout: TimeInterval = 60
 
     /// Called on `managerQueue` from `G7Sensor.handleGlucoseMessage` when a real-time EGV is parsed:
     /// marks this connection as having delivered glucose and stamps the binding-scoped last-EGV time.
@@ -242,6 +256,9 @@ class G7BluetoothManager: NSObject {
             if let peripheral = activePeripheral {
                 centralManager.cancelPeripheralConnection(peripheral)
             }
+            // C-212-1 (review): an explicit disconnect is a stop — disarm the connect watchdog so it
+            // can't reissue a connect the caller intended to stop.
+            bindingState.connectIssuedAt = nil
         }
     }
 
@@ -416,6 +433,12 @@ class G7BluetoothManager: NSObject {
         // C-207-2: a fresh connect attempt opens a new "did this connection deliver an EGV?" window.
         receivedGlucoseSinceConnect = false
         centralManager.connect(peripheral)
+        // C-212-1: arm a timeout for the active binding's connect so a wedged `.connecting` attempt
+        // (no didConnect / didFailToConnect) can't stall recovery indefinitely. Active binding only.
+        if peripheral.identifier == activePeripheralIdentifier {
+            bindingState.connectIssuedAt = now
+            scheduleConnectTimeout(peripheral)
+        }
     }
 
     /// C-210-6: true ONLY for a genuine zombie — bound to this peripheral, globally stalled (no EGV
@@ -497,6 +520,60 @@ class G7BluetoothManager: NSObject {
                   peripheral.state != .connected, peripheral.state != .connecting else { return }
             emitG7Telemetry("connect_gate_retry", "peripheral=\(pid.uuidString)")
             self.connectIfNotInFlight(peripheral)
+        }
+    }
+
+    /// C-212-1: connect watchdog. `connect()` has no timeout, so a peripheral wedged in `.connecting`
+    /// (no didConnect/didFailToConnect) would otherwise be skipped as in_flight by every later
+    /// connectIfNotInFlight forever — the build-211 multi-hour in-flight stall. While the active
+    /// binding has a pending connect (connectIssuedAt set), re-check every `connectAttemptTimeout`:
+    ///   - `.connecting` past the timeout → wedged: cancel and keep watching. Cancelling a pending
+    ///     connect may fire NO delegate callback and CB clears state asynchronously, so we must not
+    ///     rescan now (an immediate connectIfNotInFlight would skip as in_flight and re-wedge) — keep
+    ///     watching until state actually leaves `.connecting`.
+    ///   - `.disconnecting` → a cancel is settling: keep watching, don't re-issue yet.
+    ///   - `.disconnected` with the attempt still pending → the cancel settled without a callback
+    ///     clearing the marker: re-issue via the standard retrieve+connect path, which re-arms a fresh
+    ///     watchdog (so this chain ends here; no double-arm).
+    /// The watchdog clears connectIssuedAt on a `.connected` tick; an explicit `disconnect()` and
+    /// binding resets also clear it. Callbacks (didConnect/didDisconnect/didFailToConnect) do NOT, so a
+    /// belated callback from a cancelled attempt can't disarm a newer attempt's watchdog.
+    /// Generation-guarded and pinned to the exact attempt; re-issue is C-210-7-gated.
+    private func scheduleConnectTimeout(_ peripheral: CBPeripheral) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        let gen = bindingGeneration
+        let pid = peripheral.identifier
+        let issuedAt = bindingState.connectIssuedAt
+        managerQueue.asyncAfter(deadline: .now() + Self.connectAttemptTimeout) { [weak self] in
+            guard let self else { return }
+            guard self.bindingGeneration == gen,
+                  self.activePeripheralIdentifier == pid,
+                  self.bindingState.connectIssuedAt == issuedAt,
+                  let peripheral = self.activePeripheral, peripheral.identifier == pid else { return }
+            switch peripheral.state {
+            case .connecting:
+                let ageS = Int(Date().timeIntervalSince(issuedAt ?? Date()))
+                emitG7Telemetry("connect_timeout", "peripheral=\(pid.uuidString) age_s=\(ageS)")
+                self.centralManager.cancelPeripheralConnection(peripheral)
+                self.scheduleConnectTimeout(peripheral)
+            case .disconnecting:
+                self.scheduleConnectTimeout(peripheral)
+            case .disconnected:
+                emitG7Telemetry("connect_timeout_reissue", "peripheral=\(pid.uuidString)")
+                self.managerQueue_scanForPeripheral()
+                // review #2: if the reissue didn't start a new connect (gated / retrieve-miss /
+                // delegate .ignore), connectIssuedAt is unchanged and no fresh watchdog was armed —
+                // keep watching so a gated tick can't strand recovery.
+                if self.bindingState.connectIssuedAt == issuedAt {
+                    self.scheduleConnectTimeout(peripheral)
+                }
+            case .connected:
+                // review #4: normally didConnect already cleared the marker (we never reach here);
+                // clear defensively in case that callback was missed, then stop.
+                self.bindingState.connectIssuedAt = nil
+            @unknown default:
+                break
+            }
         }
     }
 
@@ -625,6 +702,9 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         // non-active managed peripheral can't refresh the active zombie's connection clock.
         if peripheral.identifier == activePeripheralIdentifier {
             bindingState.currentConnectionStartedAt = Date()
+            // C-212-1 (review): do NOT clear connectIssuedAt here — the watchdog clears it on a
+            // `.connected` tick. A belated didConnect from a cancelled attempt must not disarm a newer
+            // attempt's watchdog. (currentConnectionStartedAt stays the C-210-6 zombie clock.)
         }
 
         log.default("%{public}@: %{public}@", #function, peripheral)
@@ -647,6 +727,11 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         if peripheral.identifier == activePeripheralIdentifier {
             bindingState.currentConnectionStartedAt = nil
         }
+        // C-212-1 (review #1): do NOT clear connectIssuedAt here. A belated callback from a CANCELLED
+        // connect can arrive after the watchdog already re-issued a new connect; clearing the marker
+        // then would kill the NEW attempt's watchdog and re-wedge. connectIssuedAt is owned by connect
+        // issue (set) and the watchdog (which clears it on a `.connected` tick); the scanAfterDelay()
+        // below reissues and overwrites it.
         log.default("%{public}@: %{public}@", #function, peripheral)
         // Ignore errors indicating the peripheral disconnected remotely, as that's expected behavior
         if let error = error as NSError?, CBError(_nsError: error).code != .peripheralDisconnected {
@@ -679,6 +764,8 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         if peripheral.identifier == activePeripheralIdentifier {
             bindingState.currentConnectionStartedAt = nil
         }
+        // C-212-1 (review #1): do NOT clear connectIssuedAt here (see didDisconnect) — a belated
+        // callback from a cancelled attempt must not kill a newer attempt's watchdog.
         emitG7Telemetry(
             "did_fail_to_connect",
             "peripheral=\(peripheral.identifier.uuidString) error=\(error?.localizedDescription ?? "nil")"
