@@ -338,11 +338,32 @@ extension G7CGMManager: G7SensorDelegate {
         logDeviceCommunication("Sensor connected", type: .connection)
     }
 
+    /// C-212-3: a `suspectedEndOfSession` (remote disconnect while auth was pending) within this many
+    /// seconds of the last reading is treated as a transient blip, not a real session end. The G7
+    /// cadence is 5 min, so a reading inside ~3 cycles means the sensor is clearly alive. A genuine end
+    /// is still caught definitively by `.sessionEnded` / `sensorFailed` in didRead; this only governs
+    /// the speculative heuristic.
+    private static let suspectedEndOfSessionGracePeriod: TimeInterval = 15 * 60
+
     public func sensorDisconnected(_ sensor: G7Sensor, suspectedEndOfSession: Bool) {
         logDeviceCommunication("Sensor disconnected: suspectedEndOfSession=\(suspectedEndOfSession)", type: .connection)
-        if suspectedEndOfSession {
-            scanForNewSensor()
+        guard suspectedEndOfSession else { return }
+        // C-212-3: corroborate before discarding the binding. `suspectedEndOfSession` is only a
+        // heuristic (remote disconnect while auth was pending) and fires on transient RF blips far more
+        // often than on a real session end; every false positive forgets the current sensor and rescans
+        // (churn + dropped EGVs). If we have had a reading recently the sensor is alive — ignore the
+        // suspicion and let normal reconnect recover. Only when readings have actually stopped do we scan
+        // for a new sensor. (A real end is independently caught by `.sessionEnded` / `sensorFailed` when a
+        // reading is received, and by this same path once readings go stale past the grace window.)
+        // Accepted edge: latestReadingTimestamp is manager-level (not re-scoped per sensor), so right
+        // after a fast swap it can still hold the PRIOR sensor's time and ignore a NEW sensor's warmup
+        // blip — benign, because ignoring a transient blip on a fresh sensor is the correct action
+        // anyway, and a genuinely failed new sensor is still caught by .sessionEnded / sensorFailed.
+        if let last = latestReadingTimestamp, Date().timeIntervalSince(last) < Self.suspectedEndOfSessionGracePeriod {
+            emitG7Telemetry("suspected_eos_ignored", "secs_since_reading=\(Int(Date().timeIntervalSince(last)))")
+            return
         }
+        scanForNewSensor()
     }
 
     public func sensor(_ sensor: G7Sensor, logComms comms: String) {
