@@ -701,7 +701,16 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         // C-210-6 (review H): zombie-age baseline — ACTIVE binding only, so a did_connect for a
         // non-active managed peripheral can't refresh the active zombie's connection clock.
         if peripheral.identifier == activePeripheralIdentifier {
-            bindingState.currentConnectionStartedAt = Date()
+            // C-212-2 (review): refresh the zombie clock for the CURRENT attempt only — when a connect
+            // WE issued is still pending (connectIssuedAt set, before the watchdog clears it on its
+            // .connected tick). This both (a) always gives a genuinely new session a fresh baseline even
+            // if the prior disconnect/fail callback was missed (the new connect set connectIssuedAt), and
+            // (b) ignores a belated/duplicate didConnect on a long-lived zombie (whose connectIssuedAt was
+            // already cleared by the watchdog), so it can't reset the clock and suppress
+            // shouldRekickBoundStalled. (The C-210-6 review-D adopt path seeds the clock separately.)
+            if bindingState.connectIssuedAt != nil {
+                bindingState.currentConnectionStartedAt = Date()
+            }
             // C-212-1 (review): do NOT clear connectIssuedAt here — the watchdog clears it on a
             // `.connected` tick. A belated didConnect from a cancelled attempt must not disarm a newer
             // attempt's watchdog. (currentConnectionStartedAt stays the C-210-6 zombie clock.)
