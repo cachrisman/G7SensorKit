@@ -491,6 +491,12 @@
             "value" : "このCGMを削除しますか?"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "현재 CGM을 삭제하시겠습니까?"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -631,6 +637,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Bluetooth"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "블루투스"
           }
         },
         "nb" : {
@@ -930,6 +942,12 @@
             "value" : "Impostazioni"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정"
+          }
+        },
         "nb-NO" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1065,6 +1083,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Connesso"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "연결됨"
           }
         },
         "nb-NO" : {
@@ -1484,6 +1508,12 @@
             "value" : "CGMを削除"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CGM 삭제"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1775,6 +1805,12 @@
             "value" : "Fine"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "완료"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1930,6 +1966,12 @@
             "value" : "血糖値"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "혈당"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2077,6 +2119,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Fine Periodo supplementare"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "유예 기간 만료"
           }
         },
         "nb" : {
@@ -2514,6 +2562,12 @@
             "value" : "Ultima connessione"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "마지막 연결"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2654,6 +2708,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Ultima lettura"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "마지막 측정값"
           }
         },
         "nb" : {
@@ -2954,6 +3014,12 @@
             "value" : "プリセット名"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이름"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3097,6 +3163,12 @@
             "value" : "Apri l'app Dexcom"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "덱스콤 앱 열기"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3237,6 +3309,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Scansiona un nuovo sensore"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새 센서 검색"
           }
         },
         "nb" : {
@@ -4377,6 +4455,12 @@
             "value" : "Scadenza sensore"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "센서 만료"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4667,6 +4751,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Il sensore scade"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "센서 만료까지"
           }
         },
         "nb" : {
@@ -4961,6 +5051,12 @@
             "value" : "Inizializzazione sensore"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "센서 시작"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5247,6 +5343,12 @@
             "value" : "Orario"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시간"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5396,6 +5498,12 @@
             "value" : "トレンド"
           }
         },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "추세"
+          }
+        },
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5537,6 +5645,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Carica letture"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "측정값 업로드"
           }
         },
         "nb" : {
