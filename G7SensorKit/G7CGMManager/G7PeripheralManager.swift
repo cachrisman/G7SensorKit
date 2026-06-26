@@ -114,7 +114,7 @@ class G7PeripheralManager: NSObject {
             throw PeripheralManagerError.unknownCharacteristic
         }
 
-        try writeValue(Data([G7Opcode.extendedVersionTx.rawValue]), for: characteristic, type: .withResponse, timeout: 1)
+        try writeValue(Data([G7Opcode.extendedVersionTx.rawValue]), for: characteristic, type: .withResponse, timeout: 1, op: "write_control_extended_version")
     }
 }
 
@@ -234,7 +234,12 @@ extension G7PeripheralManager {
                 self.queue.async {
                     self.configurationRetryWorkItem = nil // clear BEFORE re-entering perform
                     guard self.peripheral.state == .connected else {
-                        emitG7Telemetry("configure_retry_abandoned", "reason=disconnected")
+                        // C-215: reset the retry budget on abandon. The same stored-id CBPeripheral reconnects
+                        // (identity-guarded peripheral didSet never fires), so without this the backoff ladder
+                        // climbs ACROSS reconnects — each successive retry less likely to fit the connection
+                        // window. The connection is already gone, so the exhaustion zombie-hold concern is moot.
+                        emitG7Telemetry("configure_retry_abandoned", "reason=disconnected attempt=\(attempt) backoff_s=\(Int(backoff))")
+                        self.configurationRetryAttempts = 0
                         return
                     }
                     self.perform(block) // a re-failure re-enters this path and schedules the next attempt
@@ -337,7 +342,7 @@ extension CBPeripheralState {
 // MARK: - Synchronous Commands
 extension G7PeripheralManager {
     /// - Throws: PeripheralManagerError
-    func runCommand(timeout: TimeInterval, command: () -> Void) throws {
+    func runCommand(timeout: TimeInterval, op: String, command: () -> Void) throws {
         // Prelude
         dispatchPrecondition(condition: .onQueue(queue))
         guard central?.state == .poweredOn && peripheral.state == .connected else {
@@ -372,7 +377,7 @@ extension G7PeripheralManager {
         }
 
         guard signaled else {
-            emitG7Telemetry("command_timeout", "timeout_s=\(Int(timeout))")
+            emitG7Telemetry("command_timeout", "op=\(op) timeout_s=\(Int(timeout))")
             throw PeripheralManagerError.timeout
         }
 
@@ -398,7 +403,7 @@ extension G7PeripheralManager {
             return
         }
 
-        try runCommand(timeout: timeout) {
+        try runCommand(timeout: timeout, op: "discover_services") {
             addCondition(.discoverServices)
 
             log.debug("discoverServices %@", String(describing: serviceUUIDs))
@@ -422,7 +427,7 @@ extension G7PeripheralManager {
             return
         }
 
-        try runCommand(timeout: timeout) {
+        try runCommand(timeout: timeout, op: "discover_characteristics") {
             addCondition(.discoverCharacteristicsForService(serviceUUID: service.uuid))
 
             log.debug("Discovering characteristics %@ for %@", String(describing: characteristicsToDiscover), String(describing: peripheral))
@@ -431,8 +436,9 @@ extension G7PeripheralManager {
     }
 
     /// - Throws: PeripheralManagerError
-    func setNotifyValue(_ enabled: Bool, for characteristic: CBCharacteristic, timeout: TimeInterval) throws {
-        try runCommand(timeout: timeout) {
+    func setNotifyValue(_ enabled: Bool, for characteristic: CBCharacteristic, timeout: TimeInterval, op: String? = nil) throws {
+        let opLabel = op ?? "set_notify_\(Self.characteristicOpName(for: characteristic))"
+        try runCommand(timeout: timeout, op: opLabel) {
             addCondition(.notificationStateUpdate(characteristicUUID: characteristic.uuid, enabled: enabled))
             log.debug("Set notify %@ for %@", String(describing: enabled), String(describing: peripheral))
             peripheral.setNotifyValue(enabled, for: characteristic)
@@ -441,7 +447,7 @@ extension G7PeripheralManager {
 
     /// - Throws: PeripheralManagerError
     func readValue(for characteristic: CBCharacteristic, timeout: TimeInterval) throws -> Data? {
-        try runCommand(timeout: timeout) {
+        try runCommand(timeout: timeout, op: "read_value_\(Self.characteristicOpName(for: characteristic))") {
             addCondition(.valueUpdate(characteristic: characteristic, matching: nil))
 
             peripheral.readValue(for: characteristic)
@@ -452,7 +458,7 @@ extension G7PeripheralManager {
 
     /// - Throws: PeripheralManagerError
     func wait(for characteristic: CBCharacteristic, timeout: TimeInterval) throws -> Data {
-        try runCommand(timeout: timeout) {
+        try runCommand(timeout: timeout, op: "wait_\(Self.characteristicOpName(for: characteristic))") {
             addCondition(.valueUpdate(characteristic: characteristic, matching: nil))
         }
 
@@ -464,13 +470,34 @@ extension G7PeripheralManager {
     }
 
     /// - Throws: PeripheralManagerError
-    func writeValue(_ value: Data, for characteristic: CBCharacteristic, type: CBCharacteristicWriteType, timeout: TimeInterval) throws {
-        try runCommand(timeout: timeout) {
+    func writeValue(_ value: Data, for characteristic: CBCharacteristic, type: CBCharacteristicWriteType, timeout: TimeInterval, op: String? = nil) throws {
+        let opLabel = op ?? "write_\(Self.characteristicOpName(for: characteristic))"
+        try runCommand(timeout: timeout, op: opLabel) {
             if case .withResponse = type {
                 addCondition(.write(characteristic: characteristic))
             }
 
             peripheral.writeValue(value, for: characteristic, type: type)
+        }
+    }
+
+    private static func characteristicOpName(for characteristic: CBCharacteristic) -> String {
+        if let uuid = CGMServiceCharacteristicUUID(rawValue: characteristic.uuid.uuidString.uppercased()) {
+            return characteristicOpName(uuid)
+        }
+        return "unknown"
+    }
+
+    private static func characteristicOpName(_ uuid: CGMServiceCharacteristicUUID) -> String {
+        switch uuid {
+        case .authentication:
+            return "authentication"
+        case .control:
+            return "control"
+        case .backfill:
+            return "backfill"
+        case .communication:
+            return "communication"
         }
     }
 }
@@ -654,7 +681,12 @@ extension G7PeripheralManager {
             throw PeripheralManagerError.unknownCharacteristic
         }
 
-        try setNotifyValue(enabled, for: characteristic, timeout: timeout)
+        try setNotifyValue(
+            enabled,
+            for: characteristic,
+            timeout: timeout,
+            op: "set_notify_\(Self.characteristicOpName(characteristicUUID))"
+        )
     }
 
 }
