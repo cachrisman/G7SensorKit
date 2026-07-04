@@ -377,7 +377,11 @@ extension G7PeripheralManager {
         }
 
         guard signaled else {
-            emitG7Telemetry("command_timeout", "op=\(op) timeout_s=\(Int(timeout))")
+            // C-216-W1a: stamp the CB states at the moment of timeout so a dead-link timeout
+            // (peripheral no longer `.connected`) can be told apart from a starved-CPU timeout
+            // (still `.connected`, callback just never ran) — the distinction build 217 needs
+            // before raising the 2s default.
+            emitG7Telemetry("command_timeout", "op=\(op) timeout_s=\(Int(timeout)) peripheral_state=\(peripheral.state.rawValue) central_state=\(central?.state.rawValue ?? -1)")
             throw PeripheralManagerError.timeout
         }
 

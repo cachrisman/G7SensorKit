@@ -186,6 +186,13 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         return bluetoothManager.isConnected
     }
 
+    /// C-216-B / W-7a: public diagnostics snapshot, forwarded from `bluetoothManager` — see
+    /// `G7BLEDiagnosticsSnapshot`'s doc comment for the "unwatched pending connect" fingerprint
+    /// build-216 heartbeat consumers key on.
+    public func diagnosticsSnapshot() -> G7BLEDiagnosticsSnapshot {
+        bluetoothManager.diagnosticsSnapshot()
+    }
+
     private func handleGlucoseMessage(message: G7GlucoseMessage, peripheralManager: G7PeripheralManager) {
         let trendStr = message.trend.map { String(format: "%.1f", $0) } ?? "nil"
         let glucoseStr = message.glucose.map { String($0) } ?? "nil"

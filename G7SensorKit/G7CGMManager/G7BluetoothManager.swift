@@ -86,6 +86,24 @@ protocol G7BluetoothManagerDelegate: AnyObject {
 }
 
 
+/// C-216-B / W-7a: point-in-time BLE diagnostics snapshot for build-216 heartbeat consumers.
+///
+/// **Diagnostic significance:** `activePeripheralStateRaw == 1` (`CBPeripheralState.connecting`)
+/// together with `connectPendingAgeS == nil` is the "unwatched pending connect" fingerprint — a
+/// `.connecting` peripheral that did NOT arise from a `connectIfNotInFlight` we issued (no
+/// `bindingState.connectIssuedAt`), e.g. a CB-restored or discovery-mode connect the C-212-1
+/// connect-attempt watchdog (`scheduleConnectTimeout`) is not watching, and so cannot time out on
+/// its own. Build-216 heartbeat consumers key on this combination.
+public struct G7BLEDiagnosticsSnapshot {
+    public let centralStateRaw: Int           // CBManagerState.rawValue
+    public let isScanning: Bool
+    public let activePeripheralStateRaw: Int? // CBPeripheralState.rawValue; nil when no active peripheral
+    public let connectPendingAgeS: Int?       // seconds since bindingState.connectIssuedAt; nil when none pending
+    public let secondsSinceLastDiscover: Int? // nil if no didDiscover yet this process
+    public let lastDiscoverRSSI: Int?         // nil if none yet
+}
+
+
 class G7BluetoothManager: NSObject {
 
     weak var delegate: G7BluetoothManagerDelegate?
@@ -104,6 +122,15 @@ class G7BluetoothManager: NSObject {
 
     /// Isolated to `managerQueue`
     private var managedPeripherals: [UUID:G7PeripheralManager] = [:]
+
+    /// C-216-A: wall-clock of the most recent `didDiscover` (any peripheral, bound or not), for the
+    /// `rssi_age_s=` staleness stamp on `attach_path`/`connect_timeout` telemetry. Isolated to
+    /// `managerQueue` (written only from `centralManager(_:didDiscover:...)`, which already
+    /// dispatch-preconditions onto it).
+    private var lastDiscoverAt: Date?
+    /// C-216-A: RSSI from that same most recent `didDiscover`. Isolated to `managerQueue` alongside
+    /// `lastDiscoverAt` — always written/read together.
+    private var lastDiscoverRSSI: Int?
 
     var activePeripheralIdentifier: UUID? {
         get {
@@ -309,16 +336,16 @@ class G7BluetoothManager: NSObject {
 
         if let peripheralID = activePeripheralIdentifier, let peripheral = centralManager.retrievePeripherals(withIdentifiers: [peripheralID]).first {
             log.default("Retrieved peripheral %{public}@", peripheral.identifier.uuidString)
-            emitG7Telemetry("attach_path", "path=stored_id peripheral=\(peripheral.identifier.uuidString)")
+            emitG7Telemetry("attach_path", "path=stored_id peripheral=\(peripheral.identifier.uuidString) \(rssiTelemetrySuffix())")
             handleDiscoveredPeripheral(peripheral)
         } else {
-            emitG7Telemetry("attach_path", "path=miss has_identifier=\(activePeripheralIdentifier != nil)")
+            emitG7Telemetry("attach_path", "path=miss has_identifier=\(activePeripheralIdentifier != nil) \(rssiTelemetrySuffix())")
             for peripheral in centralManager.retrieveConnectedPeripherals(withServices: [
                 SensorServiceUUID.advertisement.cbUUID,
                 SensorServiceUUID.cgmService.cbUUID
             ]) {
                 log.default("Found system-connected peripheral: %{public}@", peripheral.identifier.uuidString)
-                emitG7Telemetry("attach_path", "path=connected_peripherals peripheral=\(peripheral.identifier.uuidString)")
+                emitG7Telemetry("attach_path", "path=connected_peripherals peripheral=\(peripheral.identifier.uuidString) \(rssiTelemetrySuffix())")
                 handleDiscoveredPeripheral(peripheral)
             }
         }
@@ -331,7 +358,7 @@ class G7BluetoothManager: NSObject {
                 SensorServiceUUID.cgmService.cbUUID
             ]])
 
-            emitG7Telemetry("attach_path", "path=scan")
+            emitG7Telemetry("attach_path", "path=scan \(rssiTelemetrySuffix())")
             centralManager.scanForPeripherals(withServices: [
                     SensorServiceUUID.advertisement.cbUUID
                 ],
@@ -389,6 +416,39 @@ class G7BluetoothManager: NSObject {
             isConnected = activePeripheral?.state == .connected
         }
         return isConnected
+    }
+
+    /// C-216-B / W-7a: public diagnostics snapshot, contracted with a parallel adapter change — see
+    /// `G7BLEDiagnosticsSnapshot`'s doc comment for the "unwatched pending connect" fingerprint this
+    /// exists to surface. Same `notOnQueue` + `managerQueue.sync` pattern as `isScanning`/`isConnected`.
+    func diagnosticsSnapshot() -> G7BLEDiagnosticsSnapshot {
+        dispatchPrecondition(condition: .notOnQueue(managerQueue))
+
+        var snapshot: G7BLEDiagnosticsSnapshot!
+        managerQueue.sync {
+            let connectPendingAgeS = bindingState.connectIssuedAt.map { Int(Date().timeIntervalSince($0)) }
+            let secondsSinceLastDiscover = lastDiscoverAt.map { Int(Date().timeIntervalSince($0)) }
+            snapshot = G7BLEDiagnosticsSnapshot(
+                centralStateRaw: centralManager.state.rawValue,
+                isScanning: centralManager.isScanning,
+                activePeripheralStateRaw: activePeripheral?.state.rawValue,
+                connectPendingAgeS: connectPendingAgeS,
+                secondsSinceLastDiscover: secondsSinceLastDiscover,
+                lastDiscoverRSSI: lastDiscoverRSSI
+            )
+        }
+        return snapshot
+    }
+
+    /// C-216-A: shared `last_rssi=`/`rssi_age_s=` suffix for the `attach_path` and `connect_timeout`
+    /// emits, so the sentinel values (127 = BT-spec "RSSI not available", -1 = "no discover yet")
+    /// are defined in exactly one place rather than repeated at each of the 5 call sites.
+    /// managerQueue-isolated (reads `lastDiscoverAt`/`lastDiscoverRSSI`).
+    private func rssiTelemetrySuffix() -> String {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        let rssi = lastDiscoverRSSI ?? 127
+        let ageS = lastDiscoverAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
+        return "last_rssi=\(rssi) rssi_age_s=\(ageS)"
     }
 
     /// Issue a CoreBluetooth connect only when the peripheral is not already connecting or
@@ -553,7 +613,7 @@ class G7BluetoothManager: NSObject {
             switch peripheral.state {
             case .connecting:
                 let ageS = Int(Date().timeIntervalSince(issuedAt ?? Date()))
-                emitG7Telemetry("connect_timeout", "peripheral=\(pid.uuidString) age_s=\(ageS)")
+                emitG7Telemetry("connect_timeout", "peripheral=\(pid.uuidString) age_s=\(ageS) \(self.rssiTelemetrySuffix())")
                 self.centralManager.cancelPeripheralConnection(peripheral)
                 self.scheduleConnectTimeout(peripheral)
             case .disconnecting:
@@ -690,6 +750,13 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
         log.default("%{public}@: %{public}@, data = %{public}@", #function, peripheral, String(describing: advertisementData))
 
+        // C-216-A: last-discover RSSI baseline, stamped onto later attach_path/connect_timeout
+        // telemetry. Bounded rate — the scan is `allowDuplicates=false`, so this is at most once
+        // per peripheral per discovery cycle, not per-advertisement.
+        lastDiscoverAt = Date()
+        lastDiscoverRSSI = RSSI.intValue
+        emitG7Telemetry("did_discover", "peripheral=\(peripheral.identifier.uuidString) rssi=\(RSSI.intValue) bound=\(activePeripheralIdentifier != nil)")
+
         managerQueue.async {
             self.handleDiscoveredPeripheral(peripheral)
         }
@@ -720,6 +787,10 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
         if let peripheralManager = managedPeripherals[peripheral.identifier] {
             peripheralManager.centralManager(central, didConnect: peripheral)
+            // C-216-A: opportunistic RSSI sample on connect; result arrives async via
+            // `peripheralManager(_:didReadRSSI:error:)`. Read-only — CoreBluetooth serializes this
+            // against the connection's other GATT operations on its own delegate queue.
+            peripheral.readRSSI()
 
             if let delegate = delegate, case .poweredOn = centralManager.state, case .connected = peripheral.state {
                 if delegate.bluetoothManager(self, readied: peripheralManager) {
@@ -796,7 +867,10 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
 extension G7BluetoothManager: G7PeripheralManagerDelegate {
     func peripheralManager(_ manager: G7PeripheralManager, didReadRSSI RSSI: NSNumber, error: Error?) {
-
+        // C-216-A: result of the opportunistic `readRSSI()` issued in `didConnect`. Telemetry-only —
+        // no state to update here (the discover-time sample in `lastDiscoverRSSI` is what
+        // `attach_path`/`connect_timeout` stamp).
+        emitG7Telemetry("rssi_read", "value=\(RSSI.intValue) error=\(error?.localizedDescription ?? "nil")")
     }
 
     func peripheralManagerDidUpdateName(_ manager: G7PeripheralManager) {
