@@ -172,7 +172,8 @@ class G7BluetoothManager: NSObject {
         /// "connected zombie" age check.
         var currentConnectionStartedAt: Date?
         /// C-212-1: wall-clock the active binding's current connect attempt was issued while it is
-        /// still `.connecting`. Set on connect issue; thereafter owned by the connect watchdog
+        /// still `.connecting`. Set on connect issue (or on C-216-W7 watchdog adoption of a
+        /// restored/externally-created in-flight attempt); thereafter owned by the connect watchdog
         /// (`scheduleConnectTimeout`), which clears it once the attempt resolves on a `.connected` tick.
         /// Also cleared by an explicit `disconnect()` and by binding resets. Deliberately NOT cleared by
         /// didConnect/didDisconnect/didFailToConnect — a belated callback from a cancelled attempt would
@@ -191,6 +192,18 @@ class G7BluetoothManager: NSObject {
     /// Monotonic id bumped on every binding reset, captured by the delayed-retry closure so a stale
     /// closure from a prior binding no-ops instead of clearing the NEW binding's retry flag (review B).
     private var bindingGeneration = 0
+
+    /// C-216-W7: pending discovery-mode connects (unbound, or restored while unbound), keyed by
+    /// peripheral id — the population C-212-1 deliberately left unwatched (accepted limitation E).
+    /// Build-215 forensics (06-30 gap entry) measured that hole at a ≥2 h silent wedge: an unbound
+    /// connect that never completes suppresses didDiscover re-delivery (allowDuplicates=false scan)
+    /// and every telemetry-emitting path, recoverable only by process relaunch. Markers are set at
+    /// connect-issue/adopt and cleared ONLY by the discovery watchdog when it observes a settled
+    /// state — mirroring `connectIssuedAt`'s no-callback-clears invariant so a belated callback
+    /// cannot disarm a newer attempt's chain. Deliberately NOT binding-scoped (not in
+    /// `BindingBLEState`): discovery attempts are binding-independent and their cleanup must survive
+    /// binding resets. managerQueue-isolated.
+    private var pendingDiscoveryConnects: [UUID: Date] = [:]
 
     private static let connectGateWindow: TimeInterval = 300 // 5 min
     /// Normal cadence is ~1 connect / 5-min reading; allow a few recovery retries, gate true storms
@@ -470,6 +483,27 @@ class G7BluetoothManager: NSObject {
                bindingState.currentConnectionStartedAt == nil {
                 bindingState.currentConnectionStartedAt = Date()
             }
+            // C-216-W7 (arm-on-adopt): a `.connecting` peripheral this process never issued a connect
+            // for — CoreBluetooth restores pending connects across relaunch, and willRestoreState →
+            // handleDiscoveredPeripheral lands here — was previously invisible to the C-212-1
+            // watchdog (`connectIssuedAt` nil), so the wedge could persist for hours with zero
+            // connect_timeout telemetry while also suppressing scans (bound path scans only when
+            // activePeripheral == nil). Build-215 06-30 forensics: three consecutive relaunches each
+            // skipped the restored attempt as in_flight, followed by a 2 h silent gap. Adopt the
+            // attempt into the matching watchdog so it can time out and recover like a native one.
+            if peripheral.state == .connecting {
+                if peripheral.identifier == activePeripheralIdentifier {
+                    if bindingState.connectIssuedAt == nil {
+                        bindingState.connectIssuedAt = Date()
+                        emitG7Telemetry("connect_watchdog_adopted", "scope=bound peripheral=\(peripheral.identifier.uuidString)")
+                        scheduleConnectTimeout(peripheral)
+                    }
+                } else if pendingDiscoveryConnects[peripheral.identifier] == nil {
+                    pendingDiscoveryConnects[peripheral.identifier] = Date()
+                    emitG7Telemetry("connect_watchdog_adopted", "scope=discovery peripheral=\(peripheral.identifier.uuidString)")
+                    scheduleDiscoveryConnectTimeout(peripheral)
+                }
+            }
             return
         }
         // C-210-7: connect-gate. Throttle reconnect STORMS (208/209 soak saw up to 16 did_connect in a
@@ -498,6 +532,14 @@ class G7BluetoothManager: NSObject {
         if peripheral.identifier == activePeripheralIdentifier {
             bindingState.connectIssuedAt = now
             scheduleConnectTimeout(peripheral)
+        } else {
+            // C-216-W7: close C-212-1's accepted limitation E — an unbound discovery-mode connect
+            // (`.connect` intent, sensorID nil) previously had no watchdog. If it wedged in
+            // `.connecting`, nothing could time it out, and the duplicate-filtered scan cannot
+            // re-deliver didDiscover for the same peripheral within the scan session — so recovery
+            // required a process relaunch (build-215 06-30, second phase of the silent gap).
+            pendingDiscoveryConnects[peripheral.identifier] = now
+            scheduleDiscoveryConnectTimeout(peripheral)
         }
     }
 
@@ -631,6 +673,60 @@ class G7BluetoothManager: NSObject {
                 // review #4: normally didConnect already cleared the marker (we never reach here);
                 // clear defensively in case that callback was missed, then stop.
                 self.bindingState.connectIssuedAt = nil
+            @unknown default:
+                break
+            }
+        }
+    }
+
+    /// C-216-W7: discovery-scoped sibling of `scheduleConnectTimeout`, for connects issued (or
+    /// adopted) while the peripheral is NOT the active binding. Same recurring shape as C-212-1:
+    ///   - `.connecting` past the timeout → cancel and keep watching (a cancelled pending connect may
+    ///     fire no callback and CB clears state asynchronously).
+    ///   - `.disconnecting` → a cancel is settling: keep watching.
+    ///   - `.disconnected` → clear the marker and re-enter `managerQueue_scanForPeripheral()`;
+    ///     re-issuing `scanForPeripherals` restarts the scan session, which resets the scanner's
+    ///     duplicate filter (allowDuplicates=false otherwise suppresses a repeat didDiscover for this
+    ///     peripheral), so the sensor can be rediscovered and re-connected via the normal gated path.
+    ///   - `.connected` → clear and stop (the readied/auth path owns it now).
+    /// If the peripheral has become the ACTIVE binding meanwhile, ownership passes to the C-212-1
+    /// watchdog and this chain retires. Markers are cleared ONLY here (no delegate callback clears
+    /// them) — the `connectIssuedAt` invariant — so a belated callback from a cancelled attempt
+    /// cannot disarm a newer attempt's chain. No bindingGeneration guard on purpose: discovery
+    /// attempts are binding-independent and stale-attempt cleanup must survive binding resets.
+    /// All reissue paths remain C-210-7-gated via connectIfNotInFlight.
+    private func scheduleDiscoveryConnectTimeout(_ peripheral: CBPeripheral) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        let pid = peripheral.identifier
+        let issuedAt = pendingDiscoveryConnects[pid]
+        managerQueue.asyncAfter(deadline: .now() + Self.connectAttemptTimeout) { [weak self] in
+            guard let self else { return }
+            // Superseded (a newer issue/adopt re-stamped the marker) or already retired.
+            guard let issuedAt, self.pendingDiscoveryConnects[pid] == issuedAt else { return }
+            // Became the active binding since — the C-212-1 watchdog owns it now.
+            guard pid != self.activePeripheralIdentifier else {
+                self.pendingDiscoveryConnects.removeValue(forKey: pid)
+                return
+            }
+            guard let peripheral = self.managedPeripherals[pid]?.peripheral
+                ?? self.centralManager.retrievePeripherals(withIdentifiers: [pid]).first else {
+                self.pendingDiscoveryConnects.removeValue(forKey: pid)
+                return
+            }
+            switch peripheral.state {
+            case .connecting:
+                let ageS = Int(Date().timeIntervalSince(issuedAt))
+                emitG7Telemetry("discovery_connect_timeout", "peripheral=\(pid.uuidString) age_s=\(ageS)")
+                self.centralManager.cancelPeripheralConnection(peripheral)
+                self.scheduleDiscoveryConnectTimeout(peripheral)
+            case .disconnecting:
+                self.scheduleDiscoveryConnectTimeout(peripheral)
+            case .disconnected:
+                self.pendingDiscoveryConnects.removeValue(forKey: pid)
+                emitG7Telemetry("discovery_connect_timeout_rescan", "peripheral=\(pid.uuidString)")
+                self.managerQueue_scanForPeripheral()
+            case .connected:
+                self.pendingDiscoveryConnects.removeValue(forKey: pid)
             @unknown default:
                 break
             }
