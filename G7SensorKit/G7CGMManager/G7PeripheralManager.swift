@@ -157,7 +157,8 @@ extension G7PeripheralManager {
 
             if self.needsConfiguration || self.peripheral.services == nil {
                 do {
-                    try self.applyConfiguration()
+                    // C-217 Task 1 (W-1): on a background-starved watch, discovery/CCCD callbacks land just past 2s and the timeout converts a live connection into configure-retry churn inside the ~6-10s transmitter window; raise to 6s only when the watch is backgrounded. G1 evidence: 58% of command_timeouts fire on a .connected peripheral (starved-CPU, not dead-link). iPhone + foreground watch unchanged (isHostBackgrounded=false).
+                    try self.applyConfiguration(discoveryTimeout: G7BackgroundHints.isHostBackgrounded ? Self.backgroundedDiscoveryTimeout : Self.foregroundDiscoveryTimeout)
                     self.log.default("Peripheral configuration completed")
                     if let delegate = self.delegate {
                         try delegate.completeConfiguration(for: self)
@@ -268,7 +269,10 @@ extension G7PeripheralManager {
         }
     }
 
-    private func applyConfiguration(discoveryTimeout: TimeInterval = 2) throws {
+    private static let foregroundDiscoveryTimeout: TimeInterval = 2
+    private static let backgroundedDiscoveryTimeout: TimeInterval = 6
+
+    private func applyConfiguration(discoveryTimeout: TimeInterval = G7PeripheralManager.foregroundDiscoveryTimeout) throws {
         try discoverServices(configuration.serviceCharacteristics.keys.map { $0 }, timeout: discoveryTimeout)
 
         for service in peripheral.services ?? [] {
