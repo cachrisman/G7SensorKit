@@ -193,6 +193,9 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         bluetoothManager.diagnosticsSnapshot()
     }
 
+    // C-217 Task 4: passthrough for the watch adapter's episode-level central re-init.
+    public func requestCentralReinit(reason: String) { bluetoothManager.requestCentralReinit(reason: reason) }
+
     private func handleGlucoseMessage(message: G7GlucoseMessage, peripheralManager: G7PeripheralManager) {
         let trendStr = message.trend.map { String(format: "%.1f", $0) } ?? "nil"
         let glucoseStr = message.glucose.map { String($0) } ?? "nil"
