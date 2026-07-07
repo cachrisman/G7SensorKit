@@ -135,6 +135,27 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     /// The backfill data buffer
     private var backfillBuffer: [G7BackfillMessage] = []
 
+    // C-217 Task 3: gap-conditional background backfill. `lastSequence` is the most recent EGV
+    // sequence on the CURRENT binding. A background reconnect after a missed window can then detect
+    // a real gap (sequence jump > 1) and, ONLY then, arm the passive backfill subscription that
+    // C-209-11 otherwise skips while backgrounded. Thread-safe (Locked, C-208-13 pattern): written
+    // on managerQueue in handleGlucoseMessage, reset from scanForNewSensor (caller's thread). Resets
+    // to nil on sensor forget so a fresh binding never false-fires. Persists across same-sensor
+    // reconnects/.makeActive (a gap there is a real gap).
+    private let lockedLastSequence: Locked<UInt16?> = Locked(nil)
+    private var lastSequence: UInt16? {
+        get { lockedLastSequence.value }
+        set { lockedLastSequence.value = newValue }
+    }
+    /// Last time a gap-triggered background backfill subscribe was armed. Caps attempts to <= 1 per
+    /// 10 min so a throttled background subscribe cannot spin (Task 3 attempt cap).
+    private let lockedLastBgBackfillAttemptAt: Locked<Date?> = Locked(nil)
+    private var lastBackgroundBackfillAttemptAt: Date? {
+        get { lockedLastBgBackfillAttemptAt.value }
+        set { lockedLastBgBackfillAttemptAt.value = newValue }
+    }
+    private static let backgroundBackfillMinInterval: TimeInterval = 600
+
     // MARK: -
 
     private let log = OSLog(category: "G7Sensor")
@@ -165,6 +186,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
     public func scanForNewSensor() {
         self.sensorID = nil
+        self.lastSequence = nil // C-217 Task 3: fresh binding — drop gap baseline so it cannot false-fire
         bluetoothManager.disconnect()
         bluetoothManager.forgetPeripheral()
         bluetoothManager.scanForPeripheral()
@@ -214,10 +236,28 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         // add radio time inside a constrained background runtime slice. Foreground / iOS behavior
         // is unchanged (the hint defaults to false). needsVersionInfo stays true if skipped, so the
         // one-time version fetch simply happens on the next foreground connection.
+        // C-217 Task 3: compute the sequence gap on the current binding, then update the baseline.
+        // A nil prior baseline (fresh binding) yields gap 0 -> never fires.
+        let priorSequence = lastSequence
+        lastSequence = message.sequence
+        let sequenceGap: Int = priorSequence.map { Int(message.sequence) - Int($0) } ?? 0
+
         let skipBackgroundGATT = G7BackgroundHints.isHostBackgrounded
-        if skipBackgroundGATT {
-            emitG7Telemetry("background_gatt_skipped", "backfill_subscribe=true extended_version_pending=\(needsVersionInfo)")
+        // C-217 Task 3: when backgrounded, C-209-11 normally skips the backfill subscribe. Allow it
+        // ONLY when a real gap exists (sequence jump > 1) so the sensor's push-based backfill can
+        // recover the missed reading(s) -- passive-contract-clean (subscribe only, no writes). Capped
+        // to <= 1 per 10 min. The extended-version request stays background-skipped either way.
+        let now = Date()
+        let backfillCapCleared = lastBackgroundBackfillAttemptAt.map { now.timeIntervalSince($0) >= Self.backgroundBackfillMinInterval } ?? true
+        let gapTriggeredBackfill = skipBackgroundGATT && sequenceGap > 1 && backfillCapCleared
+
+        if skipBackgroundGATT && !gapTriggeredBackfill {
+            emitG7Telemetry("background_gatt_skipped", "backfill_subscribe=true extended_version_pending=\(needsVersionInfo) sequence_gap=\(sequenceGap)")
         } else {
+            if gapTriggeredBackfill {
+                lastBackgroundBackfillAttemptAt = now
+                emitG7Telemetry("background_backfill_gap", "sequence_gap=\(sequenceGap) sequence=\(message.sequence) prior_sequence=\(priorSequence.map { String($0) } ?? "nil")")
+            }
             peripheralManager.perform { (peripheral) in
                 self.log.debug("Listening for backfill responses")
                 // Subscribe to backfill updates
@@ -232,7 +272,9 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
                 }
             }
 
-            if needsVersionInfo, let name = peripheralManager.peripheral.name, name == sensorID {
+            // Keep the extended-version request background-skipped (C-209-11): only issue it in the
+            // foreground path, never on a gap-triggered background backfill.
+            if !skipBackgroundGATT, needsVersionInfo, let name = peripheralManager.peripheral.name, name == sensorID {
                 peripheralManager.perform { (peripheral) in
                     do {
                         try peripheral.requestExtendedVersion()
