@@ -187,6 +187,12 @@ class G7BluetoothManager: NSObject {
         var recentConnectIssueTimes: [Date] = []
         /// True while a drain-time gated-connect retry is queued, so repeated gating doesn't stack.
         var gatedRetryScheduled = false
+        /// C-217 Task 2: consecutive `.connecting` watchdog ticks for the current connect attempt.
+        /// Reset to 0 on every fresh connect issue (`connectIssuedAt` assignment). Tick 1 runs the
+        /// legacy cancel-and-reschedule path; tick ≥2 with escalation enabled triggers central re-init.
+        var connectWedgeTicks: Int = 0
+        /// True once `connect_wedge_persistent` has been emitted for the current wedge episode.
+        var wedgePersistentEmitted = false
     }
     private var bindingState = BindingBLEState()
     /// Monotonic id bumped on every binding reset, captured by the delayed-retry closure so a stale
@@ -205,6 +211,10 @@ class G7BluetoothManager: NSObject {
     /// binding resets. managerQueue-isolated.
     private var pendingDiscoveryConnects: [UUID: Date] = [:]
 
+    /// C-217 Task 4: wall-clock of the most recent `reinitCentral` call — 120 s anti-loop guard so a
+    /// persistent wedge cannot churn central managers. managerQueue-isolated.
+    private var lastCentralReinitAt: Date?
+
     private static let connectGateWindow: TimeInterval = 300 // 5 min
     /// Normal cadence is ~1 connect / 5-min reading; allow a few recovery retries, gate true storms
     /// (the 208/209 soak saw up to 16 did_connect in a 5-min window).
@@ -222,6 +232,9 @@ class G7BluetoothManager: NSObject {
     /// healthy connect (< a few seconds), under the 5-min cadence so a slow-but-progressing connect
     /// is not killed and a hang costs at most one cycle.
     private static let connectAttemptTimeout: TimeInterval = 60
+    /// C-217 Task 4: minimum interval between `reinitCentral` calls — prevents a re-init loop when
+    /// the wedge persists across central swaps.
+    private static let centralReinitMinInterval: TimeInterval = 120
 
     /// Called on `managerQueue` from `G7Sensor.handleGlucoseMessage` when a real-time EGV is parsed:
     /// marks this connection as having delivered glucose and stamps the binding-scoped last-EGV time.
@@ -280,6 +293,15 @@ class G7BluetoothManager: NSObject {
             log.default("Stopping scan")
             centralManager.stopScan()
             delegate?.bluetoothManagerScanningStatusDidChange(self)
+        }
+    }
+
+    /// C-217 Task 4 (C-210-8): public entry for host-driven central re-init (e.g. watch adapter
+    /// episode classifier). Async onto `managerQueue`; safe from any queue except `managerQueue`.
+    public func requestCentralReinit(reason: String) {
+        dispatchPrecondition(condition: .notOnQueue(managerQueue))
+        managerQueue.async {
+            self.reinitCentral(reason: reason)
         }
     }
 
@@ -495,6 +517,8 @@ class G7BluetoothManager: NSObject {
                 if peripheral.identifier == activePeripheralIdentifier {
                     if bindingState.connectIssuedAt == nil {
                         bindingState.connectIssuedAt = Date()
+                        bindingState.connectWedgeTicks = 0
+                        bindingState.wedgePersistentEmitted = false
                         emitG7Telemetry("connect_watchdog_adopted", "scope=bound peripheral=\(peripheral.identifier.uuidString)")
                         scheduleConnectTimeout(peripheral)
                     }
@@ -531,6 +555,8 @@ class G7BluetoothManager: NSObject {
         // (no didConnect / didFailToConnect) can't stall recovery indefinitely. Active binding only.
         if peripheral.identifier == activePeripheralIdentifier {
             bindingState.connectIssuedAt = now
+            bindingState.connectWedgeTicks = 0
+            bindingState.wedgePersistentEmitted = false
             scheduleConnectTimeout(peripheral)
         } else {
             // C-216-W7: close C-212-1's accepted limitation E — an unbound discovery-mode connect
@@ -640,6 +666,9 @@ class G7BluetoothManager: NSObject {
     /// The watchdog clears connectIssuedAt on a `.connected` tick; an explicit `disconnect()` and
     /// binding resets also clear it. Callbacks (didConnect/didDisconnect/didFailToConnect) do NOT, so a
     /// belated callback from a cancelled attempt can't disarm a newer attempt's watchdog.
+    /// C-217 Task 2: on the second+ `.connecting` tick (`connectWedgeTicks >= 2`) with escalation
+    /// enabled, emit `connect_wedge_persistent` and escalate to central re-init instead of repeating
+    /// the cancel-and-reschedule loop (cancel-with-no-callback wedges survive identical retries).
     /// Generation-guarded and pinned to the exact attempt; re-issue is C-210-7-gated.
     private func scheduleConnectTimeout(_ peripheral: CBPeripheral) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
@@ -654,7 +683,23 @@ class G7BluetoothManager: NSObject {
                   let peripheral = self.activePeripheral, peripheral.identifier == pid else { return }
             switch peripheral.state {
             case .connecting:
+                self.bindingState.connectWedgeTicks += 1
+                let ticks = self.bindingState.connectWedgeTicks
                 let ageS = Int(Date().timeIntervalSince(issuedAt ?? Date()))
+                if ticks >= 2, G7BackgroundHints.isConnectWedgeEscalationEnabled {
+                    // Debounce emit to once-per-wedge; escalation is still attempted every tick.
+                    if !self.bindingState.wedgePersistentEmitted {
+                        emitG7Telemetry(
+                            "connect_wedge_persistent",
+                            "peripheral=\(pid.uuidString) age_s=\(ageS) ticks=\(ticks) \(self.rssiTelemetrySuffix())"
+                        )
+                        self.bindingState.wedgePersistentEmitted = true
+                    }
+                    if self.escalateWedgedConnect(peripheral) {
+                        return
+                    }
+                    // reinit suppressed (Task-4 off or 120s guard) -> keep C-212-1 recovery alive
+                }
                 emitG7Telemetry("connect_timeout", "peripheral=\(pid.uuidString) age_s=\(ageS) \(self.rssiTelemetrySuffix())")
                 self.centralManager.cancelPeripheralConnection(peripheral)
                 self.scheduleConnectTimeout(peripheral)
@@ -677,6 +722,61 @@ class G7BluetoothManager: NSObject {
                 break
             }
         }
+    }
+
+    /// C-217 Task 2+4: a `.connecting` peripheral whose `cancelPeripheralConnection` yields no
+    /// delegate callback cannot be cleared at the peripheral level — retrieve/rescan return the same
+    /// cached in-flight object and `connectIfNotInFlight` skips it as in_flight. Escalate to central
+    /// re-init, which drops the wedged peripheral reference entirely.
+    private func escalateWedgedConnect(_ peripheral: CBPeripheral) -> Bool {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        return reinitCentral(reason: "wedge_escalation")
+    }
+
+    /// C-217 Task 4: replace the `CBCentralManager` to clear a peripheral wedged in `.connecting`
+    /// that survives repeated cancel-with-no-callback cycles. Does NOT rescan or re-register here —
+    /// the fresh central's `centralManagerDidUpdateState(.poweredOn)` handles both.
+    ///
+    /// ⚠️ REVIEW RISK: holding a NEW `CBCentralManager` with the SAME restore identifier
+    /// (`com.loudnate.CGMBLEKit`) while the outgoing one deallocates. Verify: old central's
+    /// `delegate=nil` + dropped reference → clean dealloc; no duplicate-restore-id warning; no
+    /// double-delivery of callbacks during the swap window.
+    ///
+    /// Fallback if central-swap proves unsafe: do NOT recreate the central; instead
+    /// `activePeripheralManager = nil` + full binding reset + `managerQueue_scanForPeripheral()`
+    /// (weaker — may not clear a truly stuck `.connecting`, but no central-swap risk).
+    @discardableResult
+    private func reinitCentral(reason: String) -> Bool {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        guard G7BackgroundHints.isCentralReinitEnabled else { return false }
+        if let last = lastCentralReinitAt, Date().timeIntervalSince(last) < Self.centralReinitMinInterval {
+            return false
+        }
+        let activeState = activePeripheral?.state.rawValue
+        emitG7Telemetry(
+            "central_reinit",
+            "reason=\(reason) active_state=\(activeState.map(String.init) ?? "nil") \(rssiTelemetrySuffix())"
+        )
+        if let peripheral = activePeripheral {
+            centralManager.cancelPeripheralConnection(peripheral)
+        }
+        managerQueue_stopScanning()
+        centralManager.delegate = nil
+        // Nil-ing `activePeripheralManager` clears `activePeripheralIdentifier` via didSet — intended;
+        // the fresh central rediscovers the sensor via name filter on the next poweredOn scan path.
+        bindingState = BindingBLEState()
+        bindingGeneration += 1
+        pendingDiscoveryConnects.removeAll()
+        managedPeripherals.removeAll()
+        activePeripheralManager = nil
+        receivedGlucoseSinceConnect = false
+        lastCentralReinitAt = Date()
+        centralManager = CBCentralManager(
+            delegate: self,
+            queue: managerQueue,
+            options: [CBCentralManagerOptionRestoreIdentifierKey: "com.loudnate.CGMBLEKit"]
+        )
+        return true
     }
 
     /// C-216-W7: discovery-scoped sibling of `scheduleConnectTimeout`, for connects issued (or
@@ -801,6 +901,12 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
         switch central.state {
         case .poweredOn:
+            // C-217 Task 4: observe restore-identifier reuse — a small since_reinit_s here traces
+            // reinit → central_powered_on → scan after a central swap.
+            emitG7Telemetry(
+                "central_powered_on",
+                "since_reinit_s=\(lastCentralReinitAt.map { Int(Date().timeIntervalSince($0)) } ?? -1)"
+            )
             // C-208-16a: register for connection events at every poweredOn, not only inside the
             // scan branch of `managerQueue_scanForPeripheral`. The bound steady-state attaches
             // via stored_id (pending connect, no scan — 95–97% of attaches in telemetry), so
@@ -831,7 +937,18 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         // M2: make CB state restoration observable in telemetry. `willRestoreState` previously logged
         // only via OSLog (invisible to BetterStack), so whether watchOS ever relaunches us for BLE was
         // unmeasurable. Emit a structured event so the entitlement question (P1) can be answered from data.
-        emitG7Telemetry("will_restore_state", "restored_peripherals=\(restoredPeripherals?.count ?? 0)")
+        // C-217 Task 4: since_reinit_s + restored_ids observe restore-identifier reuse — a small
+        // since_reinit_s is the undocumented in-process replay; restored_ids shows wedged re-inheritance.
+        let restoredIdsStr: String
+        if let peripherals = restoredPeripherals, !peripherals.isEmpty {
+            restoredIdsStr = peripherals.map { $0.identifier.uuidString }.joined(separator: ",")
+        } else {
+            restoredIdsStr = "none"
+        }
+        emitG7Telemetry(
+            "will_restore_state",
+            "restored_peripherals=\(restoredPeripherals?.count ?? 0) since_reinit_s=\(lastCentralReinitAt.map { Int(Date().timeIntervalSince($0)) } ?? -1) restored_ids=\(restoredIdsStr)"
+        )
 
         if let peripherals = restoredPeripherals {
             for peripheral in peripherals {

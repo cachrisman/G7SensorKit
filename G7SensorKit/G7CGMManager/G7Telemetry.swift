@@ -68,4 +68,29 @@ public enum G7BackgroundHints {
         get { lockedBackgrounded.value }
         set { lockedBackgrounded.value = newValue }
     }
+
+    /// C-217 Task 2 (W-4): host-settable kill-switch for the connect-wedge escalation in
+    /// `G7BluetoothManager.scheduleConnectTimeout`. Default ON for every host — a wedged pending
+    /// connect is demonstrably not recovered by repeating the identical cancel (build-215/216 soak:
+    /// 30.5%→17% of connect_timeouts at age >200 s, some >400 s across 6+ cancels), so escalation is
+    /// the correct behavior wherever the wedge occurs. The Trio watch exposes a diagnostics toggle
+    /// (mid-soak isolation of Task-2 vs Task-4 recovery attribution without a rebuild); the watchdog
+    /// reads this once per tick (window entry, on managerQueue) — never mid-operation — so a toggle
+    /// takes effect on the next cycle, not the in-flight one.
+    private static let lockedWedgeEscalationEnabled = Locked<Bool>(true)
+    public static var isConnectWedgeEscalationEnabled: Bool {
+        get { lockedWedgeEscalationEnabled.value }
+        set { lockedWedgeEscalationEnabled.value = newValue }
+    }
+
+    /// C-217 Task 4: host-settable kill-switch for `CBCentralManager` re-init escalation in
+    /// `G7BluetoothManager.reinitCentral`. Default ON — a peripheral wedged in `.connecting` whose
+    /// `cancelPeripheralConnection` yields no callback cannot be cleared at the peripheral level
+    /// (retrieve/rescan return the same cached in-flight object). The Trio watch exposes a diagnostics
+    /// toggle for mid-soak isolation of Task-2 vs Task-4 recovery attribution without a rebuild.
+    private static let lockedCentralReinitEnabled = Locked<Bool>(true)
+    public static var isCentralReinitEnabled: Bool {
+        get { lockedCentralReinitEnabled.value }
+        set { lockedCentralReinitEnabled.value = newValue }
+    }
 }
