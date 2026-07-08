@@ -70,25 +70,30 @@ public enum G7BackgroundHints {
     }
 
     /// C-217 Task 2 (W-4): host-settable kill-switch for the connect-wedge escalation in
-    /// `G7BluetoothManager.scheduleConnectTimeout`. Default ON for every host — a wedged pending
-    /// connect is demonstrably not recovered by repeating the identical cancel (build-215/216 soak:
-    /// 30.5%→17% of connect_timeouts at age >200 s, some >400 s across 6+ cancels), so escalation is
-    /// the correct behavior wherever the wedge occurs. The Trio watch exposes a diagnostics toggle
-    /// (mid-soak isolation of Task-2 vs Task-4 recovery attribution without a rebuild); the watchdog
-    /// reads this once per tick (window entry, on managerQueue) — never mid-operation — so a toggle
-    /// takes effect on the next cycle, not the in-flight one.
-    private static let lockedWedgeEscalationEnabled = Locked<Bool>(true)
+    /// `G7BluetoothManager.scheduleConnectTimeout`. **Default OFF — opt-in per host.** Only the Trio
+    /// watch observer enables it (via `G7WatchSensorAdapter.applyKillSwitchesFromDefaults`, backed by
+    /// an on-wrist @AppStorage toggle that defaults ON). The iPhone primary CGM path leaves it OFF and
+    /// relies on CoreBluetooth's own retry — the "iPhone north star" (no aggressive intervention).
+    /// **Why OFF by default (2026-07-08):** with these flags defaulting ON for every host, the
+    /// escalation + Task-4 re-init fired on the *iPhone* when an end-of-life sensor's reconnect wedged;
+    /// the re-init recreated the `CBCentralManager` in the background and it never resumed scanning →
+    /// an ~89-min iPhone CGM blackout during a real low. The sensor was fine (the watch observer kept
+    /// reading it). This is a constrained-background-observer tool, not an iPhone-primary one.
+    /// Read once per tick (window entry, on managerQueue) — never mid-operation.
+    private static let lockedWedgeEscalationEnabled = Locked<Bool>(false)
     public static var isConnectWedgeEscalationEnabled: Bool {
         get { lockedWedgeEscalationEnabled.value }
         set { lockedWedgeEscalationEnabled.value = newValue }
     }
 
     /// C-217 Task 4: host-settable kill-switch for `CBCentralManager` re-init escalation in
-    /// `G7BluetoothManager.reinitCentral`. Default ON — a peripheral wedged in `.connecting` whose
-    /// `cancelPeripheralConnection` yields no callback cannot be cleared at the peripheral level
-    /// (retrieve/rescan return the same cached in-flight object). The Trio watch exposes a diagnostics
-    /// toggle for mid-soak isolation of Task-2 vs Task-4 recovery attribution without a rebuild.
-    private static let lockedCentralReinitEnabled = Locked<Bool>(true)
+    /// `G7BluetoothManager.reinitCentral`. **Default OFF — opt-in per host** (see
+    /// `isConnectWedgeEscalationEnabled` for the full rationale + the 2026-07-08 iPhone blackout that
+    /// motivated the OFF default). Only the Trio watch observer opts in; the iPhone primary path leaves
+    /// it OFF and relies on CoreBluetooth's own retry. Note a background `CBCentralManager` recreate can
+    /// leave the new central non-scanning — so even on the watch this stays gated behind the on-wrist
+    /// toggle and is soak-watched via the `central_powered_on` / restore-id markers.
+    private static let lockedCentralReinitEnabled = Locked<Bool>(false)
     public static var isCentralReinitEnabled: Bool {
         get { lockedCentralReinitEnabled.value }
         set { lockedCentralReinitEnabled.value = newValue }
