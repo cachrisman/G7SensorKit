@@ -468,6 +468,18 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         log.debug("Received backfill response: %{public}@", response.hexadecimalString)
 
         guard response.count == 9 else {
+            // Measurement for TRIO-028: the sensor may batch several 9-byte records into one
+            // notification, which this guard would discard unparsed. `mod9` separates a
+            // batched-but-clean length from a genuinely unknown format at a glance, and the hex
+            // lets the packet be reconstructed offline — the log.debug line above is OSLog
+            // .debug, so it is not persisted and is useless retroactively.
+            let hexCap = 192
+            let hexData = response.prefix(hexCap).map { String(format: "%02X", $0) }.joined()
+            let truncated = response.count > hexCap
+            emitG7Telemetry(
+                "backfill_len_rejected",
+                "bytes=\(response.count) mod9=\(response.count % 9) truncated=\(truncated) payload=\(hexData)"
+            )
             return
         }
 
