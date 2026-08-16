@@ -501,12 +501,25 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         // Observation only: record the shape without parsing, so we can confirm
         // whether the sensor ever batches records this way without risking
         // fabricated glucose values from an unconfirmed layout.
+        //
+        // NOTE: A stream continuation packet is 2 header bytes + 8×N record bytes, so it
+        // is an exact multiple of 9 whenever N ≡ 2 (mod 9) — e.g. 2 records → 18 B, 11 → 90 B.
+        // (A first packet carries 4 extra length bytes and collides at N = 6 → 54 B.)
+        // At the default ATT MTU of 23 the max notification payload is 20 B, so an 18-byte
+        // two-record continuation is the ordinary full-size packet. The two shapes overlap at
+        // these lengths and cannot be distinguished by size alone; an in-progress stream takes
+        // precedence, so we only drop isolated packets (no active stream) here.
         if response.count > 9 && response.count % 9 == 0 {
             let recordCount = response.count / 9
             let hexCap = 192
             let hexData = response.prefix(hexCap).map { String(format: "%02X", $0) }.joined()
-            emitG7Telemetry("backfill_stream_multirecord_9byte", "bytes=\(response.count) records=\(recordCount) payload=\(hexData)")
-            return
+            let streamInProgress = backfillStreamLastSequence != 0 || !backfillStreamPayload.isEmpty
+            emitG7Telemetry("backfill_stream_multirecord_9byte", "bytes=\(response.count) records=\(recordCount) payload=\(hexData) stream_in_progress=\(streamInProgress)")
+            // Only drop when no stream is active; otherwise fall through so the packet is
+            // processed as the continuation it almost certainly is.
+            if !streamInProgress {
+                return
+            }
         }
 
         // ── Multi-packet backfill stream path ──
