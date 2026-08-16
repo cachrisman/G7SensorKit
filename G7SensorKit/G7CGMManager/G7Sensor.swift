@@ -437,10 +437,14 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
                 }
             }
         case .backfillFinished:
-            emitG7Telemetry("backfill_finished", "bytes=\(response.count)")
+            let hexCap = 192
+            let hexData = response.prefix(hexCap).map { String(format: "%02X", $0) }.joined()
+            let truncated = response.count > hexCap
+            emitG7Telemetry("backfill_finished", "bytes=\(response.count) payload=\(hexData) truncated=\(truncated)")
             flushBackfillBuffer()
         default:
-            break
+            let opcode = response[0]
+            emitG7Telemetry("unknown_control_opcode", "opcode=0x\(String(format: "%02X", opcode)) bytes=\(response.count)")
         }
     }
 
