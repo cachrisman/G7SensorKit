@@ -137,6 +137,11 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
     // MARK: - Multi-packet backfill stream state
 
+    /// Maximum accumulated size (in bytes) for the multi-packet backfill stream buffer.
+    /// Mirrors the reference implementation's 2800-byte bound; also prevents the 1-byte
+    /// sequence counter from wrapping after 255 packets.
+    private static let backfillStreamMaxAccumulatedSize = 2800
+
     /// Accumulated payload bytes from the sequenced multi-packet backfill stream.
     private var backfillStreamPayload: Data = Data()
     /// Last accepted 1-based sequence number in the current stream (0 means no packet yet).
@@ -530,6 +535,12 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         }
 
         // Accept: record the new sequence number and append payload (bytes 2 onward).
+        let packetPayloadSize = response.count - 2
+        if backfillStreamPayload.count + packetPayloadSize > Self.backfillStreamMaxAccumulatedSize {
+            backfillStreamLockedOut = true
+            emitG7Telemetry("backfill_stream_size_cap_reached", "accumulated=\(backfillStreamPayload.count) packet_payload=\(packetPayloadSize) max=\(Self.backfillStreamMaxAccumulatedSize)")
+            return
+        }
         backfillStreamLastSequence = seqByte
         backfillStreamPayload.append(response.subdata(in: 2..<response.count))
     }
