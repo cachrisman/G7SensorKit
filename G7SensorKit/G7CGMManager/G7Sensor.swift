@@ -413,7 +413,10 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
     func bluetoothManager(_ manager: G7BluetoothManager, peripheralManager: G7PeripheralManager, didReceiveControlResponse response: Data) {
 
-        guard response.count > 0 else { return }
+        guard response.count > 0 else {
+            emitG7Telemetry("empty_control_response", "bytes=0")
+            return
+        }
 
         log.default("Received control response: %{public}@", response.hexadecimalString)
 
@@ -444,14 +447,19 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             flushBackfillBuffer()
         default:
             let opcode = response[0]
+            let hexCap = 192
+            let hexData = response.prefix(hexCap).map { String(format: "%02X", $0) }.joined()
+            let truncated = response.count > hexCap
             // `default` catches two different things: a byte matching no G7Opcode case at all,
             // and a case the enum names but this switch does not handle (authChallengeRx,
             // sessionStopTx, extendedVersionRx). Reporting the latter as "unknown" would send a
             // future investigation chasing an unrecognised format the enum already names.
+            // The payload hex is what makes an unidentified message decodable offline — byte
+            // count alone gives the shape but never the content (TRIO-028).
             if G7Opcode(rawValue: opcode) != nil {
-                emitG7Telemetry("known_unhandled_control_opcode", "opcode=0x\(String(format: "%02X", opcode)) bytes=\(response.count)")
+                emitG7Telemetry("known_unhandled_control_opcode", "opcode=0x\(String(format: "%02X", opcode)) bytes=\(response.count) truncated=\(truncated) payload=\(hexData)")
             } else {
-                emitG7Telemetry("unknown_control_opcode", "opcode=0x\(String(format: "%02X", opcode)) bytes=\(response.count)")
+                emitG7Telemetry("unknown_control_opcode", "opcode=0x\(String(format: "%02X", opcode)) bytes=\(response.count) truncated=\(truncated) payload=\(hexData)")
             }
         }
     }
