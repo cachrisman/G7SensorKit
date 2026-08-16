@@ -135,6 +135,11 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     /// The backfill data buffer
     private var backfillBuffer: [G7BackfillMessage] = []
 
+    /// Cumulative rejection-signature counts for the backfill length guard.
+    /// Key: "byteLength-mod9"; value: total occurrences seen for that shape.
+    /// Not reset across connections — the running total is cumulative by design.
+    private var backfillRejectSignatures: [String: Int] = [:]
+
     // C-217 Task 3: gap-conditional background backfill. `lastSequence` is the most recent EGV
     // sequence on the CURRENT binding. A background reconnect after a missed window can then detect
     // a real gap (sequence jump > 1) and, ONLY then, arm the passive backfill subscription that
@@ -495,13 +500,29 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         // packet be reconstructed offline, since the log.debug above is OSLog .debug and is not
         // persisted.
         guard response.count >= 9, response.count % 9 == 0 else {
-            let hexCap = 192
-            let hexData = response.prefix(hexCap).map { String(format: "%02X", $0) }.joined()
-            let truncated = response.count > hexCap
-            emitG7Telemetry(
-                "backfill_len_rejected",
-                "bytes=\(response.count) mod9=\(response.count % 9) truncated=\(truncated) payload=\(hexData)"
-            )
+            let byteLen = response.count
+            let mod9 = byteLen % 9
+            let sig = "\(byteLen)-\(mod9)"
+            let count = (backfillRejectSignatures[sig] ?? 0) + 1
+            backfillRejectSignatures[sig] = count
+
+            // A shape never seen before always logs in full immediately — that is the guard's
+            // actual purpose. Only a shape that has already been characterised goes quiet, and
+            // even then the periodic total keeps its burst cadence measurable.
+            if count <= 3 {
+                let hexCap = 192
+                let hexData = response.prefix(hexCap).map { String(format: "%02X", $0) }.joined()
+                let truncated = byteLen > hexCap
+                emitG7Telemetry(
+                    "backfill_len_rejected",
+                    "bytes=\(byteLen) mod9=\(mod9) truncated=\(truncated) payload=\(hexData)"
+                )
+            } else if count % 200 == 0 {
+                emitG7Telemetry(
+                    "backfill_len_rejected_suppressed",
+                    "bytes=\(byteLen) mod9=\(mod9) total=\(count)"
+                )
+            }
             return
         }
 
