@@ -414,6 +414,12 @@ extension G7CGMManager: G7SensorDelegate {
         }
 
         guard message.hasReliableGlucose else {
+            // Field names mirror `egv_received` in G7Sensor so the accepted and rejected paths
+            // can be correlated on `sequence` without translation.
+            emitG7Telemetry(
+                "egv_unreliable",
+                "sequence=\(message.sequence) glucose=\(glucose) algorithm_state=\(message.algorithmState) algorithm_state_raw=\(message.algorithmState.rawValue)"
+            )
             updateDelegate(with: .error(AlgorithmError.unreliableState(message.algorithmState)))
             return
         }
@@ -463,6 +469,12 @@ extension G7CGMManager: G7SensorDelegate {
 
             guard entry.hasReliableGlucose else {
                 logDeviceCommunication("Backfill reading unreliable: \(entry)", type: .receive)
+                // Field names mirror `backfill_entry` in G7Sensor; backfill records carry a
+                // sensor-relative timestamp rather than a sequence number.
+                emitG7Telemetry(
+                    "backfill_entry_unreliable",
+                    "timestamp=\(entry.timestamp) glucose=\(glucose) algorithm_state=\(entry.algorithmState) algorithm_state_raw=\(entry.algorithmState.rawValue)"
+                )
                 return nil
             }
 
