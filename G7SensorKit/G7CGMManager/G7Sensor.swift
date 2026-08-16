@@ -585,7 +585,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             if hasSeqBreak { reasons.append("sequence_break") }
             if declaredExceedsTrailing { reasons.append("declared_len_exceeds_trailing") }
             if notMultipleOf8 { reasons.append("declared_len_not_multiple_of_8") }
-            emitG7Telemetry("backfill_stream_drain_aborted", "reason=\(reasons.joined(separator: ",")) declared_len=\(declaredLen) trailing_bytes=\(trailingBytes) saw_seq_break=\(hasSeqBreak)")
+            emitG7Telemetry("backfill_stream_drain_aborted", "reason=\(reasons.joined(separator: ",")) declared_len=\(declaredLen) trailing_bytes=\(trailingBytes) saw_seq_break=\(hasSeqBreak) declared_eq_trailing=\(declaredLenInt == trailingBytes) declared_eq_trailing_plus_4=\(declaredLenInt == trailingBytes + 4) declared_times_8_eq_trailing=\(declaredLenInt * 8 == trailingBytes)")
             resetBackfillStream()
             return
         }
