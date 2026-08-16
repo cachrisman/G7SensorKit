@@ -135,35 +135,6 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     /// The backfill data buffer
     private var backfillBuffer: [G7BackfillMessage] = []
 
-    // MARK: - Multi-packet backfill stream state
-
-    /// Maximum accumulated size (in bytes) for the multi-packet backfill stream buffer.
-    /// Bounded for memory and to mirror the reference implementation; does NOT prevent the
-    /// 1-byte sequence counter from wrapping (a 255-packet stream of minimum-size 3-byte
-    /// packets accumulates only 255 bytes, far below this cap). The separate
-    /// `backfillStreamMaxPacketCount` limit is what prevents sequence wrap.
-    private static let backfillStreamMaxAccumulatedSize = 2800
-
-    /// Maximum number of packets accepted into a single multi-packet backfill stream.
-    /// The wire sequence field is a single byte, so a legitimate stream cannot exceed 255
-    /// packets; exceeding that is by definition malformed and would cause the sequence to
-    /// wrap to zero (the "no stream yet" sentinel), making the next packet look like a
-    /// fresh stream start.
-    private static let backfillStreamMaxPacketCount = 255
-
-    /// Accumulated payload bytes from the sequenced multi-packet backfill stream.
-    private var backfillStreamPayload: Data = Data()
-    /// Last accepted 1-based sequence number in the current stream (0 means no packet yet).
-    private var backfillStreamLastSequence: UInt8 = 0
-    /// Whether the current stream has been locked out due to invalid first-packet content.
-    private var backfillStreamLockedOut: Bool = false
-    /// Count of packets suppressed after the stream was locked out.
-    private var backfillStreamSuppressedCount: Int = 0
-    /// Whether the current stream has seen a sequence break (a gap in the 1-based sequence numbers).
-    private var backfillStreamSawSequenceBreak: Bool = false
-    /// Number of packets accepted into the current multi-packet backfill stream.
-    private var backfillStreamPacketCount: Int = 0
-
     // C-217 Task 3: gap-conditional background backfill. `lastSequence` is the most recent EGV
     // sequence on the CURRENT binding. A background reconnect after a missed window can then detect
     // a real gap (sequence jump > 1) and, ONLY then, arm the passive backfill subscription that
@@ -214,16 +185,6 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     }
 
     public func scanForNewSensor() {
-        // Discard parsed records and multi-packet stream state BEFORE clearing sensorID.
-        // The disconnect handler's flush is gated on sensorID still matching the peripheral,
-        // so once sensorID is cleared below that flush never runs — discard here instead so no
-        // stale stream state (payload, sequence, lockout, suppressed count, seq-break) crosses
-        // into the next sensor's session.
-        let discardedRecords = backfillBuffer.count
-        let discardedPayloadBytes = backfillStreamPayload.count
-        resetBackfillStream()
-        backfillBuffer = []
-        emitG7Telemetry("backfill_stream_discarded_on_sensor_change", "records=\(discardedRecords) payload_bytes=\(discardedPayloadBytes)")
         self.sensorID = nil
         self.lastSequence = nil // C-217 Task 3: fresh binding — drop gap baseline so it cannot false-fire
         bluetoothManager.disconnect()
@@ -476,18 +437,14 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
                 }
             }
         case .backfillFinished:
-            let hexCap = 192
-            let hexData = response.prefix(hexCap).map { String(format: "%02X", $0) }.joined()
-            emitG7Telemetry("backfill_finished", "bytes=\(response.count) hex=\(hexData)")
+            emitG7Telemetry("backfill_finished", "bytes=\(response.count)")
             flushBackfillBuffer()
         default:
-            let opcode = response[0]
-            emitG7Telemetry("unknown_control_opcode", "opcode=0x\(String(format: "%02X", opcode)) bytes=\(response.count)")
+            break
         }
     }
 
     func flushBackfillBuffer() {
-        drainBackfillStream()
         if backfillBuffer.count > 0 {
             let backfill = backfillBuffer
             emitG7Telemetry("backfill_flush", "count=\(backfill.count)")
@@ -510,190 +467,37 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
         log.debug("Received backfill response: %{public}@", response.hexadecimalString)
 
-        // 9-byte single-record path — only when NO multi-packet stream is in progress.
-        // A 9-byte packet (2 header + 7 payload) is a valid continuation of an in-flight
-        // byte stream chunked at the BLE MTU; it must NOT be parsed as a standalone record
-        // when a stream is active.
-        if response.count == 9 {
-            let streamInProgress = backfillStreamLastSequence != 0 || !backfillStreamPayload.isEmpty
-            if !streamInProgress {
-                if let msg = G7BackfillMessage(data: response) {
-                    backfillBuffer.append(msg)
-                }
-                return
-            }
-            // Stream in progress: fall through to the multi-packet stream path below.
-        }
-
-        // Multiple whole 9-byte records concatenated (18, 27, 36, …).
-        // Observation only: record the shape without parsing, so we can confirm
-        // whether the sensor ever batches records this way without risking
-        // fabricated glucose values from an unconfirmed layout.
-        //
-        // NOTE: A stream continuation packet is 2 header bytes + 8×N record bytes, so it
-        // is an exact multiple of 9 whenever N ≡ 2 (mod 9) — e.g. 2 records → 18 B, 11 → 90 B.
-        // (A first packet carries 4 extra length bytes and collides at N = 6 → 54 B.)
-        // At the default ATT MTU of 23 the max notification payload is 20 B, so an 18-byte
-        // two-record continuation is the ordinary full-size packet. The two shapes overlap at
-        // these lengths and cannot be distinguished by size alone; an in-progress stream takes
-        // precedence, so we only drop isolated packets (no active stream) here.
-        if response.count > 9 && response.count % 9 == 0 {
-            let recordCount = response.count / 9
+        // TRIO-028: the sensor batches whole 9-byte records into one notification. Confirmed
+        // 2026-08-16 against a deliberate 16-minute radio gap: two 18-byte notifications decoded
+        // as four records at exact 300s spacing, matching the live readings either side and
+        // recovering one that was never seen live. Anything that is NOT a whole multiple of 9 is
+        // still an unknown shape — `mod9` distinguishes the two at a glance and the hex lets the
+        // packet be reconstructed offline, since the log.debug above is OSLog .debug and is not
+        // persisted.
+        guard response.count >= 9, response.count % 9 == 0 else {
             let hexCap = 192
             let hexData = response.prefix(hexCap).map { String(format: "%02X", $0) }.joined()
-            let streamInProgress = backfillStreamLastSequence != 0 || !backfillStreamPayload.isEmpty
-            emitG7Telemetry("backfill_stream_multirecord_9byte", "bytes=\(response.count) records=\(recordCount) payload=\(hexData) stream_in_progress=\(streamInProgress)")
-            // Only drop when no stream is active; otherwise fall through so the packet is
-            // processed as the continuation it almost certainly is.
-            if !streamInProgress {
-                return
-            }
-        }
-
-        // ── Multi-packet backfill stream path ──
-
-        // If the stream has been locked out, suppress further packets silently.
-        if backfillStreamLockedOut {
-            backfillStreamSuppressedCount += 1
+            let truncated = response.count > hexCap
+            emitG7Telemetry(
+                "backfill_len_rejected",
+                "bytes=\(response.count) mod9=\(response.count % 9) truncated=\(truncated) payload=\(hexData)"
+            )
             return
         }
 
-        // A stream packet must carry at least one payload byte (2 header + ≥1 payload).
-        // A 0–2 byte response advances the sequence counter without growing the payload,
-        // risking a wrap that evades the size cap.
-        guard response.count >= 3 else {
-            emitG7Telemetry("backfill_stream_empty_packet", "bytes=\(response.count)")
-            return
+        let recordCount = response.count / 9
+        if recordCount > 1 {
+            emitG7Telemetry("backfill_batch", "bytes=\(response.count) records=\(recordCount)")
         }
 
-        let seqByte: UInt8 = response[0]
-
-        // First-packet validation: distinguish genuinely-unrelated traffic on the same
-        // characteristic from real backfill.  Fires only once per stream (when no packet
-        // has been accepted yet, i.e. lastSequence == 0) and only when the packet is
-        // long enough to contain the sentinel positions at indices 5, 9, and 17.
-        if backfillStreamLastSequence == 0 && response.count > 17 {
-            let b5  = response[5]
-            let b9  = response[9]
-            let b17 = response[17]
-            if b5 != 0 || b9 != 0 || b17 != 0 {
-                backfillStreamLockedOut = true
-                let hexCap = 192
-                let hexData = response.prefix(hexCap).map { String(format: "%02X", $0) }.joined()
-                emitG7Telemetry("backfill_stream_locked_out", "seq=\(seqByte) bytes=\(response.count) payload=\(hexData)")
-                return
-            }
-        }
-
-        // Sequence check: byte 0 must be exactly one greater than the last accepted.
-        let expectedSeq = backfillStreamLastSequence &+ 1
-        if seqByte != expectedSeq {
-            backfillStreamSawSequenceBreak = true
-            emitG7Telemetry("backfill_stream_seq_mismatch", "expected=\(expectedSeq) got=\(seqByte) bytes=\(response.count)")
-            return
-        }
-
-        // Accept: record the new sequence number and append payload (bytes 2 onward).
-        let packetPayloadSize = response.count - 2
-        if backfillStreamPacketCount >= Self.backfillStreamMaxPacketCount {
-            backfillStreamLockedOut = true
-            emitG7Telemetry("backfill_stream_packet_count_cap_reached", "packet_count=\(backfillStreamPacketCount) max=\(Self.backfillStreamMaxPacketCount)")
-            return
-        }
-        if backfillStreamPayload.count + packetPayloadSize > Self.backfillStreamMaxAccumulatedSize {
-            backfillStreamLockedOut = true
-            emitG7Telemetry("backfill_stream_size_cap_reached", "accumulated=\(backfillStreamPayload.count) packet_payload=\(packetPayloadSize) max=\(Self.backfillStreamMaxAccumulatedSize)")
-            return
-        }
-        backfillStreamPacketCount += 1
-        backfillStreamLastSequence = seqByte
-        backfillStreamPayload.append(response.subdata(in: 2..<response.count))
-    }
-
-    /// Resets all five pieces of multi-packet backfill stream state.
-    /// Emits a telemetry event reporting the suppressed count when it is greater than zero.
-    private func resetBackfillStream() {
-        if backfillStreamSuppressedCount > 0 {
-            emitG7Telemetry("backfill_stream_reset", "suppressed=\(backfillStreamSuppressedCount)")
-        }
-        backfillStreamPayload = Data()
-        backfillStreamLastSequence = 0
-        backfillStreamLockedOut = false
-        backfillStreamSuppressedCount = 0
-        backfillStreamSawSequenceBreak = false
-        backfillStreamPacketCount = 0
-    }
-
-    /// Drains the accumulated multi-packet backfill stream into `backfillBuffer`, then resets
-    /// the stream state.  Each 8-byte stream record is expanded to the 9-byte form expected by
-    /// `G7BackfillMessage` by inserting a zero byte for the display-only flag, which the stream
-    /// form does not carry.
-    private func drainBackfillStream() {
-        guard !backfillStreamPayload.isEmpty else {
-            if backfillStreamLockedOut || backfillStreamSuppressedCount > 0 || backfillStreamLastSequence != 0 || backfillStreamSawSequenceBreak {
-                resetBackfillStream()
-            }
-            return
-        }
-
-        let payload = backfillStreamPayload
-
-        // 4-byte little-endian declared length
-        let declaredLen: UInt32
-        if payload.count >= 4 {
-            declaredLen = UInt32(payload[0])
-                | (UInt32(payload[1]) << 8)
-                | (UInt32(payload[2]) << 16)
-                | (UInt32(payload[3]) << 24)
-        } else {
-            declaredLen = 0
-        }
-
-        let trailingBytes = payload.count > 4 ? payload.count - 4 : 0
-        let declaredLenInt = Int(declaredLen)
-
-        // Abort the stream when it is incomplete or corrupt: prefer discarding over partial delivery.
-        let hasSeqBreak = backfillStreamSawSequenceBreak
-        let declaredExceedsTrailing = declaredLenInt > trailingBytes
-        let notMultipleOf8 = (declaredLen % 8) != 0
-        let isLockedOut = backfillStreamLockedOut
-
-        if hasSeqBreak || declaredExceedsTrailing || notMultipleOf8 || isLockedOut {
-            var reasons: [String] = []
-            if hasSeqBreak { reasons.append("sequence_break") }
-            if declaredExceedsTrailing { reasons.append("declared_len_exceeds_trailing") }
-            if notMultipleOf8 { reasons.append("declared_len_not_multiple_of_8") }
-            if isLockedOut { reasons.append("locked_out") }
-            emitG7Telemetry("backfill_stream_drain_aborted", "reason=\(reasons.joined(separator: ",")) declared_len=\(declaredLen) trailing_bytes=\(trailingBytes) saw_seq_break=\(hasSeqBreak) declared_eq_trailing=\(declaredLenInt == trailingBytes) declared_eq_trailing_plus_4=\(declaredLenInt == trailingBytes + 4) declared_times_8_eq_trailing=\(declaredLenInt * 8 == trailingBytes)")
-            resetBackfillStream()
-            return
-        }
-
-        let recordCount = declaredLenInt / 8
-        let surplus = trailingBytes - declaredLenInt
-
-        emitG7Telemetry("backfill_stream_drain", "declared_len=\(declaredLen) actual_bytes=\(payload.count) records=\(recordCount) surplus_bytes=\(surplus)")
-
-        // Walk the declared-length region in 8-byte steps.
-        // Stream record layout: timestamp(4 LE) + glucose(2 LE) + algo_state(1) + trend(1) = 8 bytes.
-        // The 9-byte G7BackfillMessage layout inserts a display-only flag byte between
-        // algo_state and trend; the stream form does not carry that flag, so we insert 0x00
-        // to keep it clear.
-        let endOffset = 4 + declaredLenInt
-        var offset = 4
-        while offset + 8 <= endOffset {
-            let record = payload.subdata(in: offset..<offset + 8)
-            var nineByte = Data()
-            nineByte.append(record.subdata(in: 0..<7))       // timestamp(4) + glucose(2) + algo_state(1)
-            nineByte.append(0x00)                             // display-only flag unavailable in stream form
-            nineByte.append(record[7])                        // trend
-            if let msg = G7BackfillMessage(data: nineByte) {
+        // `subdata(in:)` re-bases each record to index 0; a range subscript would keep the
+        // parent's indices and `G7BackfillMessage.init` reads absolute offsets 0...8.
+        for i in 0 ..< recordCount {
+            let record = response.subdata(in: (i * 9) ..< ((i + 1) * 9))
+            if let msg = G7BackfillMessage(data: record) {
                 backfillBuffer.append(msg)
             }
-            offset += 8
         }
-
-        resetBackfillStream()
     }
 
     func bluetoothManager(_ manager: G7BluetoothManager, peripheralManager: G7PeripheralManager, didReceiveAuthenticationResponse response: Data) {
