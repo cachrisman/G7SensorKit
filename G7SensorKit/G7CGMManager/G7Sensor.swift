@@ -497,6 +497,18 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             return
         }
 
+        // Multiple whole 9-byte records concatenated (18, 27, 36, …).
+        // Observation only: record the shape without parsing, so we can confirm
+        // whether the sensor ever batches records this way without risking
+        // fabricated glucose values from an unconfirmed layout.
+        if response.count > 9 && response.count % 9 == 0 {
+            let recordCount = response.count / 9
+            let hexCap = 192
+            let hexData = response.prefix(hexCap).map { String(format: "%02X", $0) }.joined()
+            emitG7Telemetry("backfill_stream_multirecord_9byte", "bytes=\(response.count) records=\(recordCount) payload=\(hexData)")
+            return
+        }
+
         // ── Multi-packet backfill stream path ──
 
         // If the stream has been locked out, suppress further packets silently.
@@ -545,7 +557,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         backfillStreamPayload.append(response.subdata(in: 2..<response.count))
     }
 
-    /// Resets all four pieces of multi-packet backfill stream state.
+    /// Resets all five pieces of multi-packet backfill stream state.
     /// Emits a telemetry event reporting the suppressed count when it is greater than zero.
     private func resetBackfillStream() {
         if backfillStreamSuppressedCount > 0 {
