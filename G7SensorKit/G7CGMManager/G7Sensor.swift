@@ -444,7 +444,15 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             flushBackfillBuffer()
         default:
             let opcode = response[0]
-            emitG7Telemetry("unknown_control_opcode", "opcode=0x\(String(format: "%02X", opcode)) bytes=\(response.count)")
+            // `default` catches two different things: a byte matching no G7Opcode case at all,
+            // and a case the enum names but this switch does not handle (authChallengeRx,
+            // sessionStopTx, extendedVersionRx). Reporting the latter as "unknown" would send a
+            // future investigation chasing an unrecognised format the enum already names.
+            if G7Opcode(rawValue: opcode) != nil {
+                emitG7Telemetry("known_unhandled_control_opcode", "opcode=0x\(String(format: "%02X", opcode)) bytes=\(response.count)")
+            } else {
+                emitG7Telemetry("unknown_control_opcode", "opcode=0x\(String(format: "%02X", opcode)) bytes=\(response.count)")
+            }
         }
     }
 
