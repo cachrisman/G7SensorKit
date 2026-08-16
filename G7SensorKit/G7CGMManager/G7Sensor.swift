@@ -145,6 +145,8 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     private var backfillStreamLockedOut: Bool = false
     /// Count of packets suppressed after the stream was locked out.
     private var backfillStreamSuppressedCount: Int = 0
+    /// Whether the current stream has seen a sequence break (a gap in the 1-based sequence numbers).
+    private var backfillStreamSawSequenceBreak: Bool = false
 
     // C-217 Task 3: gap-conditional background backfill. `lastSequence` is the most recent EGV
     // sequence on the CURRENT binding. A background reconnect after a missed window can then detect
@@ -522,6 +524,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         // Sequence check: byte 0 must be exactly one greater than the last accepted.
         let expectedSeq = backfillStreamLastSequence &+ 1
         if seqByte != expectedSeq {
+            backfillStreamSawSequenceBreak = true
             emitG7Telemetry("backfill_stream_seq_mismatch", "expected=\(expectedSeq) got=\(seqByte) bytes=\(response.count)")
             return
         }
@@ -541,6 +544,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         backfillStreamLastSequence = 0
         backfillStreamLockedOut = false
         backfillStreamSuppressedCount = 0
+        backfillStreamSawSequenceBreak = false
     }
 
     /// Drains the accumulated multi-packet backfill stream into `backfillBuffer`, then resets
@@ -549,7 +553,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     /// form does not carry.
     private func drainBackfillStream() {
         guard !backfillStreamPayload.isEmpty else {
-            if backfillStreamLockedOut || backfillStreamSuppressedCount > 0 || backfillStreamLastSequence != 0 {
+            if backfillStreamLockedOut || backfillStreamSuppressedCount > 0 || backfillStreamLastSequence != 0 || backfillStreamSawSequenceBreak {
                 resetBackfillStream()
             }
             return
@@ -568,18 +572,37 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             declaredLen = 0
         }
 
-        let recordBytes = payload.count > 4 ? payload.count - 4 : 0
-        let recordCount = recordBytes / 8
+        let trailingBytes = payload.count > 4 ? payload.count - 4 : 0
+        let declaredLenInt = Int(declaredLen)
 
-        emitG7Telemetry("backfill_stream_drain", "declared_len=\(declaredLen) actual_bytes=\(payload.count) records=\(recordCount)")
+        // Abort the stream when it is incomplete or corrupt: prefer discarding over partial delivery.
+        let hasSeqBreak = backfillStreamSawSequenceBreak
+        let declaredExceedsTrailing = declaredLenInt > trailingBytes
+        let notMultipleOf8 = (declaredLen % 8) != 0
 
-        // Walk the remaining bytes in 8-byte steps.
+        if hasSeqBreak || declaredExceedsTrailing || notMultipleOf8 {
+            var reasons: [String] = []
+            if hasSeqBreak { reasons.append("sequence_break") }
+            if declaredExceedsTrailing { reasons.append("declared_len_exceeds_trailing") }
+            if notMultipleOf8 { reasons.append("declared_len_not_multiple_of_8") }
+            emitG7Telemetry("backfill_stream_drain_aborted", "reason=\(reasons.joined(separator: ",")) declared_len=\(declaredLen) trailing_bytes=\(trailingBytes) saw_seq_break=\(hasSeqBreak)")
+            resetBackfillStream()
+            return
+        }
+
+        let recordCount = declaredLenInt / 8
+        let surplus = trailingBytes - declaredLenInt
+
+        emitG7Telemetry("backfill_stream_drain", "declared_len=\(declaredLen) actual_bytes=\(payload.count) records=\(recordCount) surplus_bytes=\(surplus)")
+
+        // Walk the declared-length region in 8-byte steps.
         // Stream record layout: timestamp(4 LE) + glucose(2 LE) + algo_state(1) + trend(1) = 8 bytes.
         // The 9-byte G7BackfillMessage layout inserts a display-only flag byte between
         // algo_state and trend; the stream form does not carry that flag, so we insert 0x00
         // to keep it clear.
+        let endOffset = 4 + declaredLenInt
         var offset = 4
-        while offset + 8 <= payload.count {
+        while offset + 8 <= endOffset {
             let record = payload.subdata(in: offset..<offset + 8)
             var nineByte = Data()
             nineByte.append(record.subdata(in: 0..<7))       // timestamp(4) + glucose(2) + algo_state(1)
