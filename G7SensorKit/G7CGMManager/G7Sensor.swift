@@ -528,11 +528,18 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         let payloadHex = response.count <= 8
             ? response.map { String(format: "%02X", $0) }.joined()
             : "omitted"
+        // Nearly free in exposure terms: the first byte is the opcode and the next two are already
+        // emitted in decimal as the authenticated and bonded fields.
+        let prefix4Hex = response.prefix(4).map { String(format: "%02X", $0) }.joined()
+        // Non-cryptographic change-detector: a 32-bit FNV-1a digest over the entire response,
+        // rendered as eight uppercase hex digits. Chosen so two connections can be compared without
+        // the payload itself being recoverable from a 32-bit digest of 16 bytes.
+        let fnv1a = Self.fnv1a32(response)
 
         guard let message = AuthChallengeRxMessage(data: response) else {
             emitG7Telemetry(
                 "auth_value_received",
-                "opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=false"
+                "opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=false prefix4=\(prefix4Hex) fnv1a=\(fnv1a)"
             )
             emitG7Telemetry("auth_payload_ignored", "bytes=\(response.count)")
             log.debug("Ignoring authentication response: %{public}@", response.hexadecimalString)
@@ -541,7 +548,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         let gatePass = message.isAuthenticated && message.isBonded
         emitG7Telemetry(
             "auth_value_received",
-            "opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=\(gatePass)"
+            "opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=\(gatePass) prefix4=\(prefix4Hex) fnv1a=\(fnv1a)"
         )
         if gatePass {
             log.debug("Observed authenticated session. enabling notifications for control characteristic.")
@@ -575,6 +582,23 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         self.delegateQueue.async {
             self.delegate?.sensorConnectionStatusDidUpdate(self)
         }
+    }
+
+    // MARK: - Non-cryptographic digest helpers
+
+    /// 32-bit FNV-1a over `data`, returned as eight uppercase hex digits.
+    ///
+    /// Offset basis 2166136261 (0x811C9DC5); per-byte fold: XOR then wrapping-multiply by the
+    /// prime 16777619. This is a **non-cryptographic change-detector**, not a security primitive:
+    /// it exists so two connections can be compared for equality without the payload itself being
+    /// recoverable — a 32-bit digest of 16 bytes has ~2^32 preimages.
+    private static func fnv1a32(_ data: Data) -> String {
+        var hash: UInt32 = 0x811C9DC5
+        for byte in data {
+            hash ^= UInt32(byte)
+            hash = hash &* 16_777_619
+        }
+        return String(format: "%08X", hash)
     }
 }
 
