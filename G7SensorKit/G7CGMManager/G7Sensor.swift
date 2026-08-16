@@ -203,6 +203,16 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     }
 
     public func scanForNewSensor() {
+        // Discard parsed records and multi-packet stream state BEFORE clearing sensorID.
+        // The disconnect handler's flush is gated on sensorID still matching the peripheral,
+        // so once sensorID is cleared below that flush never runs — discard here instead so no
+        // stale stream state (payload, sequence, lockout, suppressed count, seq-break) crosses
+        // into the next sensor's session.
+        let discardedRecords = backfillBuffer.count
+        let discardedPayloadBytes = backfillStreamPayload.count
+        resetBackfillStream()
+        backfillBuffer = []
+        emitG7Telemetry("backfill_stream_discarded_on_sensor_change", "records=\(discardedRecords) payload_bytes=\(discardedPayloadBytes)")
         self.sensorID = nil
         self.lastSequence = nil // C-217 Task 3: fresh binding — drop gap baseline so it cannot false-fire
         bluetoothManager.disconnect()
@@ -489,12 +499,19 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
         log.debug("Received backfill response: %{public}@", response.hexadecimalString)
 
-        // 9-byte single-record path — behaviour unchanged
+        // 9-byte single-record path — only when NO multi-packet stream is in progress.
+        // A 9-byte packet (2 header + 7 payload) is a valid continuation of an in-flight
+        // byte stream chunked at the BLE MTU; it must NOT be parsed as a standalone record
+        // when a stream is active.
         if response.count == 9 {
-            if let msg = G7BackfillMessage(data: response) {
-                backfillBuffer.append(msg)
+            let streamInProgress = backfillStreamLastSequence != 0 || !backfillStreamPayload.isEmpty
+            if !streamInProgress {
+                if let msg = G7BackfillMessage(data: response) {
+                    backfillBuffer.append(msg)
+                }
+                return
             }
-            return
+            // Stream in progress: fall through to the multi-packet stream path below.
         }
 
         // Multiple whole 9-byte records concatenated (18, 27, 36, …).
@@ -530,7 +547,13 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             return
         }
 
-        guard response.count >= 2 else { return }
+        // A stream packet must carry at least one payload byte (2 header + ≥1 payload).
+        // A 0–2 byte response advances the sequence counter without growing the payload,
+        // risking a wrap that evades the size cap.
+        guard response.count >= 3 else {
+            emitG7Telemetry("backfill_stream_empty_packet", "bytes=\(response.count)")
+            return
+        }
 
         let seqByte: UInt8 = response[0]
 
@@ -615,12 +638,14 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         let hasSeqBreak = backfillStreamSawSequenceBreak
         let declaredExceedsTrailing = declaredLenInt > trailingBytes
         let notMultipleOf8 = (declaredLen % 8) != 0
+        let isLockedOut = backfillStreamLockedOut
 
-        if hasSeqBreak || declaredExceedsTrailing || notMultipleOf8 {
+        if hasSeqBreak || declaredExceedsTrailing || notMultipleOf8 || isLockedOut {
             var reasons: [String] = []
             if hasSeqBreak { reasons.append("sequence_break") }
             if declaredExceedsTrailing { reasons.append("declared_len_exceeds_trailing") }
             if notMultipleOf8 { reasons.append("declared_len_not_multiple_of_8") }
+            if isLockedOut { reasons.append("locked_out") }
             emitG7Telemetry("backfill_stream_drain_aborted", "reason=\(reasons.joined(separator: ",")) declared_len=\(declaredLen) trailing_bytes=\(trailingBytes) saw_seq_break=\(hasSeqBreak) declared_eq_trailing=\(declaredLenInt == trailingBytes) declared_eq_trailing_plus_4=\(declaredLenInt == trailingBytes + 4) declared_times_8_eq_trailing=\(declaredLenInt * 8 == trailingBytes)")
             resetBackfillStream()
             return
