@@ -165,7 +165,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
     private let log = OSLog(category: "G7Sensor")
 
-    private let bluetoothManager = G7BluetoothManager()
+    private let bluetoothManager: G7BluetoothManager
 
     private let delegateQueue = DispatchQueue(label: "com.loopkit.G7Sensor.delegateQueue", qos: .unspecified)
 
@@ -184,8 +184,13 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         emitG7Telemetry("sensor_name_locked", "locked_name=\(name)")
     }
 
-    public init(sensorID: String?) {
+    public convenience init(sensorID: String?) {
+        self.init(sensorID: sensorID, bluetoothManager: G7BluetoothManager())
+    }
+
+    init(sensorID: String?, bluetoothManager: G7BluetoothManager) {
         lockedSensorID = Locked(sensorID)
+        self.bluetoothManager = bluetoothManager
         bluetoothManager.delegate = self
     }
 
@@ -264,7 +269,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
                 emitG7Telemetry("background_backfill_gap", "sequence_gap=\(sequenceGap) sequence=\(message.sequence) prior_sequence=\(priorSequence.map { String($0) } ?? "nil")")
             }
             peripheralManager.perform { (peripheral) in
-                self.log.debug("Listening for backfill responses")
+                self.log.default("Listening for backfill responses")
                 // Subscribe to backfill updates
                 do {
                     try peripheral.listenToCharacteristic(.backfill)
@@ -340,7 +345,10 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         }
 
         peripheralManager.perform { (peripheral) in
-            self.log.info("Listening for authentication responses for %{public}@", String(describing: peripheralManager.peripheral.name))
+            // .default so this survives into a sysdiagnose: info and debug are
+            // memory-only and are not written to the log archive, which makes the
+            // auth handshake invisible in field diagnostics.
+            self.log.default("Listening for authentication responses for %{public}@", String(describing: peripheralManager.peripheral.name))
             do {
                 try peripheral.listenToCharacteristic(.authentication)
                 self.pendingAuth = true
@@ -563,7 +571,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
                 "opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=false prefix4=\(prefix4Hex) fnv1a=\(fnv1a)"
             )
             emitG7Telemetry("auth_payload_ignored", "bytes=\(response.count)")
-            log.debug("Ignoring authentication response: %{public}@", response.hexadecimalString)
+            log.default("Ignoring authentication response: %{public}@", response.hexadecimalString)
             return
         }
         let gatePass = message.isAuthenticated && message.isBonded
@@ -572,7 +580,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             "opcode=0x\(String(format: "%02X", opcode)) authenticated=\(authByte) bonded=\(bondByte) payload_len=\(response.count) payload=\(payloadHex) gate_passed=\(gatePass) prefix4=\(prefix4Hex) fnv1a=\(fnv1a)"
         )
         if gatePass {
-            log.debug("Observed authenticated session. enabling notifications for control characteristic.")
+            log.default("Observed authenticated session. enabling notifications for control characteristic.")
             pendingAuth = false
             emitG7Telemetry("auth_authenticated_bonded", "peripheral=\(peripheralManager.peripheral.identifier.uuidString)")
             peripheralManager.perform { (peripheral) in
@@ -589,7 +597,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             }
         } else {
             emitG7Telemetry("auth_payload_ignored", "bytes=\(response.count)")
-            log.debug("Ignoring authentication response: %{public}@", response.hexadecimalString)
+            log.default("Ignoring authentication response: %{public}@", response.hexadecimalString)
         }
     }
 
