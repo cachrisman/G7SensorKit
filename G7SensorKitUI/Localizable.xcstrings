@@ -500,7 +500,7 @@
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Er du sikker på at du vil slette denne CGM?"
+            "value" : "Er du sikker på at du vil slette denne CGM-en?"
           }
         },
         "nb-NO" : {
@@ -1541,7 +1541,7 @@
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Slett CGM"
+            "value" : "Fjern CGM"
           }
         },
         "nb-NO" : {
@@ -2166,7 +2166,7 @@
         "nl" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Einde Verlenging"
+            "value" : "Einde verlenging"
           }
         },
         "pl" : {
@@ -2607,7 +2607,7 @@
         "nl" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Laatste Verbinding"
+            "value" : "Laatste verbinding"
           }
         },
         "pl" : {
@@ -2755,7 +2755,7 @@
         "nl" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Laatste Meting"
+            "value" : "Laatste meting"
           }
         },
         "pl" : {
@@ -3166,7 +3166,7 @@
         "fr" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ouvrir l'app Dexcom"
+            "value" : "Ouvrir l'application Dexcom"
           }
         },
         "he" : {
@@ -3463,7 +3463,7 @@
         "fr" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Balayage"
+            "value" : "Recherche en cours"
           }
         },
         "he" : {
@@ -4506,7 +4506,7 @@
         "nl" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sensor Vervaldatum "
+            "value" : "Sensor vervaldatum "
           }
         },
         "pl" : {
@@ -4643,7 +4643,7 @@
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sensor utløpt"
+            "value" : "Sensoren er utløpt"
           }
         },
         "nb-NO" : {
@@ -4941,7 +4941,7 @@
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sensor feilet"
+            "value" : "Sensorfeil"
           }
         },
         "nb-NO" : {
@@ -5686,7 +5686,7 @@
         "nb" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Last opp avlesninger"
+            "value" : "Last opp målinger"
           }
         },
         "nb-NO" : {
@@ -5698,7 +5698,7 @@
         "nl" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Upload Metingen"
+            "value" : "Upload metingen"
           }
         },
         "pl" : {
