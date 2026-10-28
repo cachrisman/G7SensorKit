@@ -22,6 +22,8 @@ public struct G7CGMManagerState: RawRepresentable, Equatable {
     public var latestReadingTimestamp: Date?
     public var latestConnect: Date?
     public var uploadReadings: Bool = true
+    /// TRIO-094: opt-in active backfill request (0x59) on a sequence gap. Default off.
+    public var requestMissedReadings: Bool = false
     /// When a suspected session end started its grace period, or nil if none is
     /// pending. Persisted so a grace period survives app termination: the deferred
     /// scan is an in-memory work item, so without this a genuinely ended session
@@ -43,6 +45,7 @@ public struct G7CGMManagerState: RawRepresentable, Equatable {
         self.latestReadingTimestamp = rawValue["latestReadingTimestamp"] as? Date
         self.latestConnect = rawValue["latestConnect"] as? Date
         self.uploadReadings = rawValue["uploadReadings"] as? Bool ?? true
+        self.requestMissedReadings = rawValue["requestMissedReadings"] as? Bool ?? false
         self.suspectedSessionEndAt = rawValue["suspectedSessionEndAt"] as? Date
     }
 
@@ -55,6 +58,7 @@ public struct G7CGMManagerState: RawRepresentable, Equatable {
         rawValue["latestReadingTimestamp"] = latestReadingTimestamp
         rawValue["latestConnect"] = latestConnect
         rawValue["uploadReadings"] = uploadReadings
+        rawValue["requestMissedReadings"] = requestMissedReadings
         rawValue["suspectedSessionEndAt"] = suspectedSessionEndAt
         return rawValue
     }

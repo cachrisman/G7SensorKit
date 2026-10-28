@@ -177,6 +177,19 @@ public class G7CGMManager: CGMManager {
         }
     }
 
+    /// TRIO-094: opt-in active backfill request on a sequence gap (experimental, default off).
+    public var requestMissedReadings: Bool {
+        get {
+            return state.requestMissedReadings
+        }
+        set {
+            mutateState { state in
+                state.requestMissedReadings = newValue
+            }
+            sensor.requestMissedReadings = newValue
+        }
+    }
+
     public let sensor: G7Sensor
 
     public var cgmManagerStatus: LoopKit.CGMManagerStatus {
@@ -224,6 +237,7 @@ public class G7CGMManager: CGMManager {
         lockedState = Locked(state)
         self.sensor = sensor
         sensor.delegate = self
+        sensor.requestMissedReadings = state.requestMissedReadings // TRIO-094
         // A grace period may have been in flight when the app was last terminated.
         restorePendingSuspectedSessionEnd()
     }
@@ -241,6 +255,7 @@ public class G7CGMManager: CGMManager {
             "latestReadingTimestamp: \(String(describing: state.latestReadingTimestamp))",
             "latestConnect: \(String(describing: state.latestConnect))",
             "uploadReadings: \(String(describing: state.uploadReadings))",
+            "requestMissedReadings: \(String(describing: state.requestMissedReadings))",
         ]
         return lines.joined(separator: "\n")
     }

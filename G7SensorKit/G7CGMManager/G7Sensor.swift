@@ -161,6 +161,46 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     }
     private static let backgroundBackfillMinInterval: TimeInterval = 600
 
+    // TRIO-094: opt-in active backfill request (0x59) on a sequence gap.
+    private let lockedRequestMissedReadings = Locked(false)
+    /// Whether to actively request backfill on a sequence gap. Default off; set by `G7CGMManager` from its
+    /// persisted state, so hosts that use `G7Sensor` alone (watch) never enable it. Thread-safe.
+    var requestMissedReadings: Bool {
+        get { lockedRequestMissedReadings.value }
+        set { lockedRequestMissedReadings.value = newValue }
+    }
+
+    /// TRIO-094: `glucoseTimestamp` (glucose time, not message time) of the most recent EGV on the current binding,
+    /// kept next to `lastSequence` to anchor the start of a backfill request range.
+    private let lockedLastGlucoseTimestamp: Locked<UInt32?> = Locked(nil)
+    private var lastGlucoseTimestamp: UInt32? {
+        get { lockedLastGlucoseTimestamp.value }
+        set { lockedLastGlucoseTimestamp.value = newValue }
+    }
+
+    /// TRIO-094: set once a backfill request was attempted on this connection; reset on ready and disconnect.
+    private let lockedBackfillRequestedThisConnection = Locked(false)
+    private var backfillRequestedThisConnection: Bool {
+        get { lockedBackfillRequestedThisConnection.value }
+        set { lockedBackfillRequestedThisConnection.value = newValue }
+    }
+
+    /// TRIO-094: the range of the outstanding backfill request (sensor seconds), until its result is reported.
+    private let lockedOutstandingBackfillRange: Locked<(start: UInt32, end: UInt32)?> = Locked(nil)
+    private var outstandingBackfillRange: (start: UInt32, end: UInt32)? {
+        get { lockedOutstandingBackfillRange.value }
+        set { lockedOutstandingBackfillRange.value = newValue }
+    }
+    private static let maxBackfillRequestSpan: UInt32 = 3 * 60 * 60
+
+    /// TRIO-094: records received while a request is outstanding that fall inside its range.
+    private let lockedOutstandingBackfillRecords: Locked<[G7BackfillMessage]> = Locked([])
+    /// TRIO-094: 0x59 acknowledgements seen while a request is outstanding that were not attributed to it.
+    private let lockedOtherBackfillAcks = Locked(0)
+
+    /// TRIO-094: bumped on every ready and disconnect so a queued request block can tell it is stale.
+    private let lockedConnectionGeneration = Locked(0)
+
     // MARK: -
 
     private let log = OSLog(category: "G7Sensor")
@@ -197,6 +237,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     public func scanForNewSensor() {
         self.sensorID = nil
         self.lastSequence = nil // C-217 Task 3: fresh binding — drop gap baseline so it cannot false-fire
+        self.lastGlucoseTimestamp = nil // TRIO-094
         bluetoothManager.disconnect()
         bluetoothManager.forgetPeripheral()
         bluetoothManager.scanForPeripheral()
@@ -250,6 +291,8 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         // A nil prior baseline (fresh binding) yields gap 0 -> never fires.
         let priorSequence = lastSequence
         lastSequence = message.sequence
+        let priorGlucoseTimestamp = lastGlucoseTimestamp // TRIO-094
+        lastGlucoseTimestamp = message.glucoseTimestamp
         let sequenceGap: Int = priorSequence.map { Int(message.sequence) - Int($0) } ?? 0
 
         let skipBackgroundGATT = G7BackgroundHints.isHostBackgrounded
@@ -293,6 +336,8 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
                     }
                 }
             }
+
+            requestMissedReadingsIfNeeded(message: message, priorSequence: priorSequence, priorGlucoseTimestamp: priorGlucoseTimestamp, sequenceGap: sequenceGap, peripheralManager: peripheralManager)
         }
 
         if sensorID == nil, let name = peripheralManager.peripheral.name, let activationDate = activationDate  {
@@ -328,6 +373,106 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         }
     }
 
+    /// TRIO-094: wall-clock ISO 8601 for a sensor-seconds value via the activation date, or "nil" when unknown.
+    private func backfillWallString(_ sensorSeconds: UInt32) -> String {
+        guard let activationDate = activationDate else {
+            return "nil"
+        }
+        return ISO8601DateFormatter().string(from: activationDate.addingTimeInterval(TimeInterval(sensorSeconds)))
+    }
+
+    /// TRIO-094: after a sequence gap, actively ask the sensor for the missed range (opt-in, once per connection).
+    private func requestMissedReadingsIfNeeded(message: G7GlucoseMessage, priorSequence: UInt16?, priorGlucoseTimestamp: UInt32?, sequenceGap: Int, peripheralManager: G7PeripheralManager) {
+        guard requestMissedReadings else { return }
+        guard let priorSequence = priorSequence, sequenceGap > 1 else { return }
+        guard let name = peripheralManager.peripheral.name, name == sensorID else { return }
+        guard !G7BackgroundHints.isHostBackgrounded else { return }
+        guard !backfillRequestedThisConnection else { return }
+
+        // TRIO-094: the range is in glucose time (backfill record timestamps are glucose times). End excludes the current reading (already in hand), so the Dexcom app's own one-record backfill of it falls outside our range.
+        let end = Int64(message.glucoseTimestamp) - 1
+        var start = priorGlucoseTimestamp.map { Int64($0) + 1 } ?? (Int64(message.glucoseTimestamp) - Int64(sequenceGap) * 300)
+        start = max(start, end - Int64(Self.maxBackfillRequestSpan), 0)
+        guard start < end else { return }
+
+        backfillRequestedThisConnection = true
+        let startSeconds = UInt32(start)
+        let endSeconds = UInt32(end)
+        let generation = lockedConnectionGeneration.value
+
+        peripheralManager.perform { (peripheral) in
+            // TRIO-094: the connection may have cycled between scheduling and running; never touch a newer connection's state.
+            guard self.lockedConnectionGeneration.value == generation, peripheral.peripheral.state == .connected else {
+                emitG7Telemetry("backfill_request_skipped", "reason=stale_connection")
+                return
+            }
+            self.lockedOutstandingBackfillRecords.value = []
+            self.lockedOtherBackfillAcks.value = 0
+            self.outstandingBackfillRange = (start: startSeconds, end: endSeconds)
+            do {
+                try peripheral.requestBackfill(start: startSeconds, end: endSeconds)
+                emitG7Telemetry(
+                    "backfill_request_sent",
+                    "start_s=\(startSeconds) end_s=\(endSeconds) start_date=\(self.backfillWallString(startSeconds)) end_date=\(self.backfillWallString(endSeconds)) sequence_gap=\(sequenceGap) prior_sequence=\(priorSequence) sequence=\(message.sequence)"
+                )
+            } catch let error {
+                self.clearOutstandingBackfill()
+                emitG7Telemetry("backfill_request_failed", "error=\(error.localizedDescription)")
+                self.log.error("Error trying to request backfill: %{public}@", String(describing: error))
+            }
+        }
+    }
+
+    private func clearOutstandingBackfill() {
+        outstandingBackfillRange = nil
+        lockedOutstandingBackfillRecords.value = []
+        lockedOtherBackfillAcks.value = 0
+    }
+
+    /// TRIO-094: called from `flushBackfillBuffer` (the queue that fills `backfillBuffer`) with the flushed records; keeps those inside the outstanding request's range, and is a no-op when none is outstanding. Records the Dexcom app requested that fall inside our range are counted too; they are recovered readings either way.
+    private func noteFlushedBackfillRecordsForRequest(_ records: [G7BackfillMessage]) {
+        guard let range = outstandingBackfillRange else { return }
+        let inRange = records.filter { $0.timestamp >= range.start && $0.timestamp <= range.end }
+        guard !inRange.isEmpty else { return }
+        _ = lockedOutstandingBackfillRecords.mutate { $0.append(contentsOf: inRange) }
+    }
+
+    /// TRIO-094: report the outstanding request's outcome, once, then clear it. `ack` is nil when the connection ended first.
+    private func reportBackfillRequestResult(finished: Bool, ack: (status: UInt8, first: UInt32, last: UInt32)?) {
+        guard outstandingBackfillRange != nil else { return }
+        let records = lockedOutstandingBackfillRecords.value
+        let otherAcks = lockedOtherBackfillAcks.value
+        clearOutstandingBackfill()
+        let firstDate = records.first.map { backfillWallString($0.timestamp) } ?? "nil"
+        let lastDate = records.last.map { backfillWallString($0.timestamp) } ?? "nil"
+        let ackStatus = ack.map { String($0.status) } ?? "nil"
+        let ackFirst = ack.map { String($0.first) } ?? "nil"
+        let ackLast = ack.map { String($0.last) } ?? "nil"
+        emitG7Telemetry(
+            "backfill_request_result",
+            "records=\(records.count) first_date=\(firstDate) last_date=\(lastDate) in_range=\(records.count) finished=\(finished) ack_status=\(ackStatus) ack_first_s=\(ackFirst) ack_last_s=\(ackLast) other_acks=\(otherAcks)"
+        )
+    }
+
+    /// TRIO-094: attribute a 0x59 acknowledgement to the outstanding request (layout per DiaBLE).
+    private func handleBackfillAck(_ response: Data) {
+        guard let range = outstandingBackfillRange else { return }
+        if response.count >= 19 {
+            func leUInt32(_ offset: Int) -> UInt32 {
+                let base = response.startIndex + offset
+                return (0..<4).reduce(UInt32(0)) { $0 | (UInt32(response[base + $1]) << UInt32(8 * $1)) }
+            }
+            let length = leUInt32(3)
+            let first = leUInt32(11)
+            let last = leUInt32(15)
+            if length > 0, first >= range.start, last <= range.end {
+                reportBackfillRequestResult(finished: true, ack: (status: response[response.startIndex + 1], first: first, last: last))
+                return
+            }
+        }
+        _ = lockedOtherBackfillAcks.mutate { $0 += 1 }
+    }
+
     // MARK: - BluetoothManagerDelegate
 
     func bluetoothManager(_ manager: G7BluetoothManager, readied peripheralManager: G7PeripheralManager) -> Bool {
@@ -336,6 +481,12 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         let peripheralID = peripheralManager.peripheral.identifier.uuidString
         let isFollowing = (sensorID != nil && sensorID == peripheralName)
         emitG7Telemetry("gatt_ready", "peripheral=\(peripheralID) following_known=\(isFollowing)")
+
+        // TRIO-094: a newly readied peripheral starts a fresh connection.
+        _ = lockedConnectionGeneration.mutate { $0 += 1 }
+        backfillRequestedThisConnection = false
+        clearOutstandingBackfill()
+        peripheralManager.resetUnmatchedWhilePendingCount()
 
         if let sensorID = sensorID, sensorID == peripheralManager.peripheral.name {
             shouldStopScanning = true
@@ -378,10 +529,21 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             "disconnect",
             "peripheral=\(peripheralID) was_remote=\(wasRemoteDisconnect) pending_auth=\(pendingAuth) followed=\(isFollowed)"
         )
+        // TRIO-094
+        let unmatchedWhilePending = peripheralManager.unmatchedWhilePendingCount
+        if unmatchedWhilePending > 0 {
+            emitG7Telemetry("unmatched_notification_while_pending_summary", "count=\(unmatchedWhilePending)")
+        }
+        peripheralManager.resetUnmatchedWhilePendingCount()
+        _ = lockedConnectionGeneration.mutate { $0 += 1 }
+        backfillRequestedThisConnection = false
         if let sensorID = sensorID, sensorID == peripheralManager.peripheral.name {
 
             // Sometimes we do not receive the backfillFinished message before disconnect
             flushBackfillBuffer()
+
+            // TRIO-094: a request still outstanding at disconnect never got its acknowledgement.
+            reportBackfillRequestResult(finished: false, ack: nil)
 
             let suspectedEndOfSession: Bool
 
@@ -458,6 +620,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             let truncated = response.count > hexCap
             emitG7Telemetry("backfill_finished", "bytes=\(response.count) payload=\(hexData) truncated=\(truncated)")
             flushBackfillBuffer()
+            handleBackfillAck(response) // TRIO-094
         default:
             let opcode = response[0]
             let hexCap = 192
@@ -490,6 +653,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
                 )
             }
             self.backfillBuffer = []
+            noteFlushedBackfillRecordsForRequest(backfill) // TRIO-094
             delegateQueue.async {
                 self.delegate?.sensor(self, didReadBackfill: backfill)
             }

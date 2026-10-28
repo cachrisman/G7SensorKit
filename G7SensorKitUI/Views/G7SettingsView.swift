@@ -129,6 +129,9 @@ struct G7SettingsView: View {
                 HStack {
                     Toggle(LocalizedString("Upload Readings", comment: "title for g7 config settings to upload readings"), isOn: $viewModel.uploadReadings)
                 }
+                HStack {
+                    Toggle(LocalizedString("Request Missed Readings (Experimental)", comment: "TRIO-094: title for g7 config settings to actively request missed readings from the sensor"), isOn: $viewModel.requestMissedReadings)
+                }
             }
             
             Section () {

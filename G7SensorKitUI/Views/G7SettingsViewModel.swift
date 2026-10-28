@@ -31,6 +31,12 @@ class G7SettingsViewModel: ObservableObject {
         }
     }
     
+    @Published var requestMissedReadings: Bool = false {
+        didSet {
+            cgmManager.requestMissedReadings = requestMissedReadings
+        }
+    }
+
     let displayGlucosePreference: DisplayGlucosePreference
 
     private var lastReading: G7GlucoseMessage?
@@ -80,6 +86,7 @@ class G7SettingsViewModel: ObservableObject {
         lastReading = cgmManager.latestReading
         latestReadingTimestamp = cgmManager.latestReadingTimestamp
         uploadReadings = cgmManager.state.uploadReadings
+        requestMissedReadings = cgmManager.state.requestMissedReadings
         lifetime = cgmManager.lifetime
         warmupDuration = cgmManager.warmupDuration
     }

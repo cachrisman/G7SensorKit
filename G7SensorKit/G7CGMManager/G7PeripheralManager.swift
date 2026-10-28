@@ -66,6 +66,20 @@ class G7PeripheralManager: NSObject {
     /// Any error surfaced during the active operation
     private var commandError: Error?
 
+    /// TRIO-094: label of the command currently inside `runCommand`; guarded by `commandLock`.
+    private var currentCommandOp: String?
+
+    private let lockedUnmatchedWhilePendingCount = Locked(0)
+    /// TRIO-094: notifications delivered to the delegate while a command was pending on this connection
+    /// (the old gate would have dropped them). Thread-safe.
+    var unmatchedWhilePendingCount: Int {
+        lockedUnmatchedWhilePendingCount.value
+    }
+
+    func resetUnmatchedWhilePendingCount() {
+        lockedUnmatchedWhilePendingCount.value = 0
+    }
+
     private(set) weak var central: CBCentralManager?
 
     let configuration: Configuration
@@ -115,6 +129,27 @@ class G7PeripheralManager: NSObject {
         }
 
         try writeValue(Data([G7Opcode.extendedVersionTx.rawValue]), for: characteristic, type: .withResponse, timeout: 1, op: "write_control_extended_version")
+    }
+
+    /// TRIO-094: actively request backfill for [start, end] (sensor seconds since activation).
+    /// 0x59 is both the request and its acknowledgement opcode (`G7Opcode.backfillFinished`); see upstream
+    /// LoopKit requestBackfillIfNeeded, Juggluco askfilldata, xDrip+ BackFillTxMessage2.
+    func requestBackfill(start: UInt32, end: UInt32) throws {
+        self.log.default("Requesting sensor backfill %{public}d-%{public}d", start, end);
+        guard let service = peripheral.services?.itemWithUUID(SensorServiceUUID.cgmService.cbUUID) else {
+            self.log.error("Peripheral missing cgm service. Services = %{public}@", String(describing: peripheral.services));
+            throw PeripheralManagerError.invalidConfiguration
+        }
+
+        guard let characteristic = service.characteristics?.itemWithUUID(CGMServiceCharacteristicUUID.control.cbUUID) else {
+            throw PeripheralManagerError.unknownCharacteristic
+        }
+
+        var request = Data([G7Opcode.backfillFinished.rawValue])
+        withUnsafeBytes(of: start.littleEndian) { request.append(contentsOf: $0) }
+        withUnsafeBytes(of: end.littleEndian) { request.append(contentsOf: $0) }
+
+        try writeValue(request, for: characteristic, type: .withResponse, timeout: 1, op: "write_control_backfill_request")
     }
 }
 
@@ -367,6 +402,9 @@ extension G7PeripheralManager {
             throw PeripheralManagerError.invalidConfiguration
         }
 
+        currentCommandOp = op // TRIO-094
+        defer { currentCommandOp = nil }
+
         // Run
         command()
 
@@ -616,6 +654,7 @@ extension G7PeripheralManager: CBPeripheralDelegate {
         commandLock.lock()
 
         var notifyDelegate = false
+        var unmatchedWhilePending: (op: String, n: Int)?
 
         if let index = commandConditions.firstIndex(where: { (condition) -> Bool in
             if case .valueUpdate(characteristic: characteristic, matching: let matching) = condition {
@@ -632,11 +671,30 @@ extension G7PeripheralManager: CBPeripheralDelegate {
             }
         } else if let macro = configuration.valueUpdateMacros[characteristic.uuid] {
             macro(self)
-        } else if commandConditions.isEmpty {
+        } else {
+            // TRIO-094: upstream LoopKit 764e002 delivers unconditionally: a pending write threw the glucose reply away ("Seen in the field as signal loss").
             notifyDelegate = true // execute after the unlock
+            if !commandConditions.isEmpty {
+                let n = lockedUnmatchedWhilePendingCount.mutate { $0 += 1 }
+                unmatchedWhilePending = (op: currentCommandOp ?? "nil", n: n)
+            }
         }
 
         commandLock.unlock()
+
+        if let (pendingOp, n) = unmatchedWhilePending {
+            // TRIO-094: control and authentication always emit; the 20-byte burst stream (~600 packets) is capped at 3 per connection.
+            let name = Self.characteristicOpName(for: characteristic)
+            let isKeyCharacteristic = name == "control" || name == "authentication"
+            if isKeyCharacteristic || n <= 3 {
+                let value = characteristic.value
+                let opcode = value?.first.map { String(format: "0x%02X", $0) } ?? "nil"
+                emitG7Telemetry(
+                    "unmatched_notification_while_pending",
+                    "char=\(name == "backfill" || isKeyCharacteristic ? name : "other") opcode=\(opcode) bytes=\(value?.count ?? 0) pending_op=\(pendingOp) n=\(n)"
+                )
+            }
+        }
 
         if notifyDelegate {
             // If we weren't expecting this notification, pass it along to the delegate
