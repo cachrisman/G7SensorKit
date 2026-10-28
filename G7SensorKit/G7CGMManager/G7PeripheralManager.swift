@@ -157,8 +157,8 @@ extension G7PeripheralManager {
 
             if self.needsConfiguration || self.peripheral.services == nil {
                 do {
-                    // C-217 Task 1 (W-1): on a background-starved watch, discovery/CCCD callbacks land just past 2s and the timeout converts a live connection into configure-retry churn inside the ~6-10s transmitter window; raise to 6s only when the watch is backgrounded. G1 evidence: 58% of command_timeouts fire on a .connected peripheral (starved-CPU, not dead-link). iPhone + foreground watch unchanged (isHostBackgrounded=false).
-                    try self.applyConfiguration(discoveryTimeout: G7BackgroundHints.isHostBackgrounded ? Self.backgroundedDiscoveryTimeout : Self.foregroundDiscoveryTimeout)
+                    // Foreground is 5s on every host (iPhone and foreground watch) since TRIO-093: 2026-10-28 phone telemetry showed 86-92% of command_timeouts firing on a still-connected peripheral and 29-39% of auth-timeout replies arriving 1-2s after the 2s timeout, within a 7-10s connection window. A backgrounded watch keeps 6s (C-217 W-1).
+                    try self.applyConfiguration(discoveryTimeout: Self.currentDiscoveryTimeout)
                     self.log.default("Peripheral configuration completed")
                     if let delegate = self.delegate {
                         try delegate.completeConfiguration(for: self)
@@ -269,10 +269,13 @@ extension G7PeripheralManager {
         }
     }
 
-    private static let foregroundDiscoveryTimeout: TimeInterval = 2
+    private static let foregroundDiscoveryTimeout: TimeInterval = 5
     private static let backgroundedDiscoveryTimeout: TimeInterval = 6
+    private static var currentDiscoveryTimeout: TimeInterval { G7BackgroundHints.isHostBackgrounded ? backgroundedDiscoveryTimeout : foregroundDiscoveryTimeout }
+    /// The pre-TRIO-093 foreground timeout; ops slower than this would have timed out before and count what the longer timeout rescues.
+    private static let slowCommandThreshold: TimeInterval = 2
 
-    private func applyConfiguration(discoveryTimeout: TimeInterval = G7PeripheralManager.foregroundDiscoveryTimeout) throws {
+    private func applyConfiguration(discoveryTimeout: TimeInterval = G7PeripheralManager.currentDiscoveryTimeout) throws {
         try discoverServices(configuration.serviceCharacteristics.keys.map { $0 }, timeout: discoveryTimeout)
 
         for service in peripheral.services ?? [] {
@@ -373,7 +376,11 @@ extension G7PeripheralManager {
         }
 
         // Postlude
-        let signaled = commandLock.wait(until: Date(timeIntervalSinceNow: timeout))
+        let start = Date()
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        // NSCondition may wake spuriously; loop until the callbacks have drained commandConditions or the deadline passes (TRIO-093 review)
+        while !commandConditions.isEmpty && commandLock.wait(until: deadline) {}
+        let signaled = commandConditions.isEmpty
 
         defer {
             commandError = nil
@@ -387,6 +394,11 @@ extension G7PeripheralManager {
             // before raising the 2s default.
             emitG7Telemetry("command_timeout", "op=\(op) timeout_s=\(Int(timeout)) peripheral_state=\(peripheral.state.rawValue) central_state=\(central?.state.rawValue ?? -1)")
             throw PeripheralManagerError.timeout
+        }
+
+        let elapsed = Date().timeIntervalSince(start)
+        if elapsed > Self.slowCommandThreshold {
+            emitG7Telemetry("command_slow", "op=\(op) elapsed_ms=\(Int(elapsed * 1000)) timeout_s=\(Int(timeout)) peripheral_state=\(peripheral.state.rawValue)")
         }
 
         if let error = commandError {
@@ -559,9 +571,11 @@ extension G7PeripheralManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         commandLock.lock()
 
+        // A failed enable leaves isNotifying unchanged, so match on the UUID when the callback carries an error,
+        // so the error is surfaced instead of waiting out the timeout (TRIO-093 review).
         if let index = commandConditions.firstIndex(where: { (condition) -> Bool in
-            if case .notificationStateUpdate(characteristicUUID: characteristic.uuid, enabled: characteristic.isNotifying) = condition {
-                return true
+            if case .notificationStateUpdate(characteristicUUID: let uuid, enabled: let enabled) = condition {
+                return uuid == characteristic.uuid && (error != nil || enabled == characteristic.isNotifying)
             } else {
                 return false
             }
@@ -683,7 +697,7 @@ extension G7PeripheralManager {
 
     func setNotifyValue(_ enabled: Bool,
         for characteristicUUID: CGMServiceCharacteristicUUID,
-        timeout: TimeInterval = 2) throws
+        timeout: TimeInterval? = nil) throws
     {
         guard let characteristic = getCharacteristicWithUUID(characteristicUUID) else {
             throw PeripheralManagerError.unknownCharacteristic
@@ -692,7 +706,7 @@ extension G7PeripheralManager {
         try setNotifyValue(
             enabled,
             for: characteristic,
-            timeout: timeout,
+            timeout: timeout ?? Self.currentDiscoveryTimeout,
             op: "set_notify_\(Self.characteristicOpName(characteristicUUID))"
         )
     }
