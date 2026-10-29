@@ -170,6 +170,13 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         set { lockedRequestMissedReadings.value = newValue }
     }
 
+    /// TRIO-099: set once the toggle state was logged this launch (see `backfill_toggle_state`).
+    private let lockedLoggedToggleStateThisLaunch = Locked(false)
+    private var loggedToggleStateThisLaunch: Bool {
+        get { lockedLoggedToggleStateThisLaunch.value }
+        set { lockedLoggedToggleStateThisLaunch.value = newValue }
+    }
+
     /// TRIO-094: `glucoseTimestamp` (glucose time, not message time) of the most recent EGV on the current binding,
     /// kept next to `lastSequence` to anchor the start of a backfill request range.
     private let lockedLastGlucoseTimestamp: Locked<UInt32?> = Locked(nil)
@@ -276,6 +283,12 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             "egv_received",
             "glucose=\(glucoseStr) sequence=\(message.sequence) algorithm_state=\(message.algorithmState.rawValue) age_s=\(message.age) message_timestamp=\(message.messageTimestamp) trend_rate=\(trendStr) display_only=\(message.glucoseIsDisplayOnly)"
         )
+        // TRIO-099: logged here, not at G7CGMManager.init — the host assigns G7Telemetry.emit after the manager is created, so an init-time emission would be dropped.
+        // Marked logged only once a sink exists, so a reading that beats the host's setup doesn't suppress it.
+        if !loggedToggleStateThisLaunch, G7Telemetry.emit != nil {
+            emitG7Telemetry("backfill_toggle_state", "enabled=\(requestMissedReadings)")
+            loggedToggleStateThisLaunch = true
+        }
         // C-207-2: this connection delivered a real-time EGV, so a subsequent disconnect is the
         // transmitter's normal post-reading shutdown — `scanAfterDelay` should keep its 2s grace.
         // (A disconnect with this flag still false ⇒ pre-EGV drop ⇒ immediate rescan.) Runs on
@@ -383,17 +396,35 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
     /// TRIO-094: after a sequence gap, actively ask the sensor for the missed range (opt-in, once per connection).
     private func requestMissedReadingsIfNeeded(message: G7GlucoseMessage, priorSequence: UInt16?, priorGlucoseTimestamp: UInt32?, sequenceGap: Int, peripheralManager: G7PeripheralManager) {
-        guard requestMissedReadings else { return }
+        // TRIO-099: skip reasons are logged only on a real gap.
+        guard requestMissedReadings else {
+            if priorSequence != nil, sequenceGap > 1 {
+                emitG7Telemetry("backfill_request_skipped", "reason=disabled sequence_gap=\(sequenceGap) sequence=\(message.sequence)")
+            }
+            return
+        }
         guard let priorSequence = priorSequence, sequenceGap > 1 else { return }
-        guard let name = peripheralManager.peripheral.name, name == sensorID else { return }
-        guard !G7BackgroundHints.isHostBackgrounded else { return }
-        guard !backfillRequestedThisConnection else { return }
+        guard let name = peripheralManager.peripheral.name, name == sensorID else {
+            emitG7Telemetry("backfill_request_skipped", "reason=not_current_sensor sequence_gap=\(sequenceGap) sequence=\(message.sequence)")
+            return
+        }
+        guard !G7BackgroundHints.isHostBackgrounded else {
+            emitG7Telemetry("backfill_request_skipped", "reason=host_backgrounded sequence_gap=\(sequenceGap) sequence=\(message.sequence)")
+            return
+        }
+        guard !backfillRequestedThisConnection else {
+            emitG7Telemetry("backfill_request_skipped", "reason=already_requested_this_connection sequence_gap=\(sequenceGap) sequence=\(message.sequence)")
+            return
+        }
 
         // TRIO-094: the range is in glucose time (backfill record timestamps are glucose times). End excludes the current reading (already in hand), so the Dexcom app's own one-record backfill of it falls outside our range.
         let end = Int64(message.glucoseTimestamp) - 1
         var start = priorGlucoseTimestamp.map { Int64($0) + 1 } ?? (Int64(message.glucoseTimestamp) - Int64(sequenceGap) * 300)
         start = max(start, end - Int64(Self.maxBackfillRequestSpan), 0)
-        guard start < end else { return }
+        guard start < end else {
+            emitG7Telemetry("backfill_request_skipped", "reason=empty_range sequence_gap=\(sequenceGap) sequence=\(message.sequence)")
+            return
+        }
 
         backfillRequestedThisConnection = true
         let startSeconds = UInt32(start)

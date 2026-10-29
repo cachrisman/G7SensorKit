@@ -183,10 +183,14 @@ public class G7CGMManager: CGMManager {
             return state.requestMissedReadings
         }
         set {
+            let old = state.requestMissedReadings // TRIO-099
             mutateState { state in
                 state.requestMissedReadings = newValue
             }
             sensor.requestMissedReadings = newValue
+            if newValue != old {
+                emitG7Telemetry("backfill_toggle", "enabled=\(newValue) previous=\(old)")
+            }
         }
     }
 
