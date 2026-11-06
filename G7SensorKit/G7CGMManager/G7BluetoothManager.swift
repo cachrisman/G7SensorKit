@@ -352,7 +352,7 @@ class G7BluetoothManager: NSObject {
 
     // MARK: - Synchronization
 
-    let managerQueue =DispatchQueue(label: "com.loudnate.CGMBLEKit.bluetoothManagerQueue", qos: .unspecified)
+    let managerQueue = DispatchQueue(label: "com.loudnate.CGMBLEKit.bluetoothManagerQueue", qos: .unspecified)
 
     /// Whether a `.poweredOn` recheck is already pending. Confined to `managerQueue`.
     private var poweredOnRecheckScheduled = false
