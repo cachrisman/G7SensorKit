@@ -382,7 +382,9 @@ class G7BluetoothManager: NSObject {
 
         managerQueue.sync {
             #if os(watchOS)
-            self.acquisitionArm = G7WatchAcquisition(manager: self)
+            let enabled = G7BackgroundHints.isWatchAcquisitionArmEnabled
+            self.acquisitionArm = enabled ? G7WatchAcquisition(manager: self) : nil
+            emitG7Telemetry("watch_acquisition_mode", "arm=\(enabled ? "upstream" : "stock")")
             #else
             self.acquisitionArm = nil
             #endif

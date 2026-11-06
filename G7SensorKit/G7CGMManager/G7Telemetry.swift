@@ -98,4 +98,15 @@ public enum G7BackgroundHints {
         get { lockedCentralReinitEnabled.value }
         set { lockedCentralReinitEnabled.value = newValue }
     }
+
+    /// watchOS only: chooses which acquisition path `G7BluetoothManager` uses. `true` selects
+    /// upstream's `G7WatchAcquisition`; `false` (the default, as shipped before the 2026-11 upstream
+    /// merge) selects the stock retrieve-or-scan path with the fork's connect watchdogs. Read once
+    /// when a `G7BluetoothManager` is created, so the host must set it before constructing
+    /// `G7Sensor`; a change applies to the next `G7Sensor` / app launch. No effect on iOS.
+    private static let lockedWatchAcquisitionArmEnabled = Locked<Bool>(false)
+    public static var isWatchAcquisitionArmEnabled: Bool {
+        get { lockedWatchAcquisitionArmEnabled.value }
+        set { lockedWatchAcquisitionArmEnabled.value = newValue }
+    }
 }

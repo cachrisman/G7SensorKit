@@ -365,6 +365,17 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         self.init(mode: mode, credentials: credentials, bluetoothManager: G7BluetoothManager(), displayType: displayType)
     }
 
+    /// Eavesdropping session for a host outside this module (the Trio watch app), following the sensor another app paired; restores the pre-2026-11 public init(sensorID:).
+    public convenience init(sensorID: String?) {
+        let displayType: G7DisplayType
+        #if os(watchOS)
+        displayType = .watch
+        #else
+        displayType = .phone
+        #endif
+        self.init(mode: .eavesdropping, credentials: G7SensorCredentials(sensorID: sensorID), displayType: displayType)
+    }
+
     init(mode: G7SessionMode, credentials: G7SensorCredentials, bluetoothManager: G7BluetoothManager, displayType: G7DisplayType = .phone) {
         self.mode = mode
         self.displayType = displayType
@@ -493,7 +504,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     }
 
     /// Seeds the acquisition arm's reading clock after a relaunch; nothing without an arm.
-    func noteLatestReading(at date: Date) {
+    public func noteLatestReading(at date: Date) {
         bluetoothManager.noteReading(at: date)
     }
 
@@ -507,7 +518,7 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         bluetoothManager.scanForPeripheral()
     }
 
-    func recheckAcquisition() {
+    public func recheckAcquisition() {
         bluetoothManager.recheckAcquisition()
     }
 
