@@ -5,6 +5,10 @@
 //  Created by Pete Schwamb on 11/11/22.
 //  Copyright © 2022 LoopKit Authors. All rights reserved.
 //
+//  Active-peripheral tracking, the powered-on recheck and central recreation
+//  are derived from DexKit by Erik Tolboom
+//  (https://github.com/nightscout/DexKit).
+//
 
 import CoreBluetooth
 import Foundation
@@ -18,6 +22,9 @@ enum PeripheralConnectionCommand {
 }
 
 protocol G7BluetoothManagerDelegate: AnyObject {
+    /// A signal-strength reading for a connected peripheral, requested with `readRSSI()`.
+    func bluetoothManager(_ manager: G7BluetoothManager, peripheralManager: G7PeripheralManager, didReadRSSI rssi: NSNumber, error: Error?)
+
 
     /**
      Tells the delegate that the bluetooth manager has finished connecting to and discovering all required services of its peripheral
@@ -47,7 +54,17 @@ protocol G7BluetoothManagerDelegate: AnyObject {
 
      - returns: PeripheralConnectionCommand indicating what should be done with this peripheral
      */
-    func bluetoothManager(_ manager: G7BluetoothManager, shouldConnectPeripheral peripheral: CBPeripheral) -> PeripheralConnectionCommand
+    func bluetoothManager(_ manager: G7BluetoothManager, shouldConnectPeripheral peripheral: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) -> PeripheralConnectionCommand
+
+    /**
+     Asks the delegate whether peripherals restored by CoreBluetooth's state
+     restoration should be adopted.
+
+     A session says yes: that is how it resumes its own sensor after a relaunch.
+     A pairing run says no, because a stale restored peripheral would be treated
+     as a candidate and crowd out the sensor actually being paired.
+     */
+    func bluetoothManagerShouldAcceptRestoredPeripherals(_ manager: G7BluetoothManager) -> Bool
 
     /// Informs the delegate that the bluetooth manager received new data in the control characteristic
     ///
@@ -83,8 +100,48 @@ protocol G7BluetoothManagerDelegate: AnyObject {
     /// - Parameters:
     ///   - manager: The bluetooth manager
     func peripheralDidDisconnect(_ manager: G7BluetoothManager, peripheralManager: G7PeripheralManager, wasRemoteDisconnect: Bool)
+
+    /// One line for the host's device log (OmnipodKit's omnipodLogDeviceEvent shape).
+    func bluetoothManager(_ manager: G7BluetoothManager, logEvent line: String)
+
+    /// Whether a connection could be authenticated (direct: a pairing code or stored key;
+    /// eavesdropping: always).
+    func bluetoothManagerCanAuthenticate(_ manager: G7BluetoothManager) -> Bool
+
+    /// A peripheral was adopted as the sensor (nil when one was let go of).
+    func bluetoothManager(_ manager: G7BluetoothManager, didAdoptPeripheral identifier: UUID?)
+
+    /// `needsCodeForSensor` or `isSearchingForSensor` changed.
+    func bluetoothManagerStatusDidChange(_ manager: G7BluetoothManager)
 }
 
+extension G7BluetoothManagerDelegate {
+    func bluetoothManager(_ manager: G7BluetoothManager, peripheralManager: G7PeripheralManager, didReadRSSI rssi: NSNumber, error: Error?) {}
+    func bluetoothManager(_ manager: G7BluetoothManager, logEvent line: String) {}
+    func bluetoothManagerCanAuthenticate(_ manager: G7BluetoothManager) -> Bool { true }
+    func bluetoothManager(_ manager: G7BluetoothManager, didAdoptPeripheral identifier: UUID?) {}
+    func bluetoothManagerStatusDidChange(_ manager: G7BluetoothManager) {}
+}
+
+/// Takes over acquisition where a platform cannot use the stock steps (watchOS: the app sleeps
+/// between readings and its scanning is rationed). Called on the manager's queue.
+protocol G7AcquisitionArm: AnyObject {
+    /// In place of the stock retrieve-or-scan.
+    func scan()
+    /// In place of the stock connect to an adopted sensor.
+    func found(_ peripheral: CBPeripheral)
+    func connected(_ peripheral: CBPeripheral)
+    /// True when the arm owns what happens next; false runs the stock rescan.
+    func disconnected(_ peripheral: CBPeripheral, error: Error?) -> Bool
+    func failedToConnect(_ peripheral: CBPeripheral, error: Error?) -> Bool
+    func radioDown()
+    /// A peripheral handed back by state restoration, after the stock adoption.
+    func restored(_ peripheral: CBPeripheral)
+    /// A reading's own sensor timestamp.
+    func noteReading(at timestamp: Date)
+    /// Any wake: put acquisition right if a lost callback left nothing standing.
+    func recheck()
+}
 
 /// C-216-B / W-7a: point-in-time BLE diagnostics snapshot for build-216 heartbeat consumers.
 ///
@@ -111,17 +168,75 @@ class G7BluetoothManager: NSObject {
     private let log = OSLog(category: "G7BluetoothManager")
 
     /// Isolated to `managerQueue`
-    private var centralManager: CBCentralManager! = nil
+    var centralManager: CBCentralManager! = nil
+
+    /// Whether the radio is usable: off, unauthorized, or on. Readable from
+    /// any queue; changes are announced through
+    /// `bluetoothManagerScanningStatusDidChange`.
+    var centralState: CBManagerState {
+        centralManager?.state ?? .unknown
+    }
 
     /// Isolated to `managerQueue`
-    private var activePeripheral: CBPeripheral? {
+    var activePeripheral: CBPeripheral? {
         get {
             return activePeripheralManager?.peripheral
         }
     }
 
     /// Isolated to `managerQueue`
-    private var managedPeripherals: [UUID:G7PeripheralManager] = [:]
+    var managedPeripherals: [UUID:G7PeripheralManager] = [:]
+
+    /// The platform's acquisition arm, or nil for the stock steps. Set once in init, before the
+    /// central can call back.
+    private(set) var acquisitionArm: G7AcquisitionArm?
+
+    private let lockedNeedsCodeForSensor = Locked<String?>(nil)
+    private let lockedIsSearchingForSensor = Locked(false)
+
+    /// The sensor a direct connection would reach without a pairing code or key; nil once one exists.
+    var needsCodeForSensor: String? { lockedNeedsCodeForSensor.value }
+
+    /// Scanning for a sensor this controller has never connected to.
+    var isSearchingForSensor: Bool { lockedIsSearchingForSensor.value }
+
+    func setNeedsCodeForSensor(_ name: String?) {
+        guard lockedNeedsCodeForSensor.value != name else { return }
+        lockedNeedsCodeForSensor.value = name
+        delegate?.bluetoothManagerStatusDidChange(self)
+    }
+
+    func setIsSearchingForSensor(_ searching: Bool) {
+        guard lockedIsSearchingForSensor.value != searching else { return }
+        lockedIsSearchingForSensor.value = searching
+        delegate?.bluetoothManagerStatusDidChange(self)
+    }
+
+    var activePeripheralIdentifier: UUID? {
+        get {
+            return lockedPeripheralIdentifier.value
+        }
+    }
+    private let lockedPeripheralIdentifier: Locked<UUID?> = Locked(nil)
+
+    /// Targets a known peripheral directly, so a relaunch can retrieve it by
+    /// identifier instead of waiting for its next advertisement. Passing nil
+    /// reopens the search to any sensor in range.
+    func setActivePeripheralIdentifier(_ identifier: UUID?) {
+        lockedPeripheralIdentifier.value = identifier
+    }
+
+    /// Isolated to `managerQueue`
+    var activePeripheralManager: G7PeripheralManager? {
+        didSet {
+            oldValue?.delegate = nil
+            lockedPeripheralIdentifier.value = activePeripheralManager?.peripheral.identifier
+            let identifier = activePeripheralManager?.peripheral.identifier
+            if identifier != oldValue?.peripheral.identifier, !suppressAdoptNotification {
+                delegate?.bluetoothManager(self, didAdoptPeripheral: identifier)
+            }
+        }
+    }
 
     /// C-216-A: wall-clock of the most recent `didDiscover` (any peripheral, bound or not), for the
     /// `rssi_age_s=` staleness stamp on `attach_path`/`connect_timeout` telemetry. Isolated to
@@ -132,28 +247,11 @@ class G7BluetoothManager: NSObject {
     /// `lastDiscoverAt` — always written/read together.
     private var lastDiscoverRSSI: Int?
 
-    var activePeripheralIdentifier: UUID? {
-        get {
-            return lockedPeripheralIdentifier.value
-        }
-    }
-    private let lockedPeripheralIdentifier: Locked<UUID?> = Locked(nil)
-
-    /// Isolated to `managerQueue`
-    private var activePeripheralManager: G7PeripheralManager? {
-        didSet {
-            oldValue?.delegate = nil
-            lockedPeripheralIdentifier.value = activePeripheralManager?.peripheral.identifier
-        }
-    }
-
     /// C-207-2: `true` once a real-time glucose message has been parsed on the current connection.
     /// Reset to `false` when a connect is issued (`connectIfNotInFlight`); set to `true` by
-    /// `G7Sensor.handleGlucoseMessage`. A disconnect with this still `false` means the transmitter
-    /// dropped *before* delivering an EGV (pre-auth / pre-EGV) — it is likely still advertising, so
-    /// `scanAfterDelay()` rescans immediately instead of waiting the 2s post-EGV shutdown grace.
-    /// Isolated to `managerQueue` (written/read only on that queue: connect issue, glucose parse,
-    /// and the disconnect-path `scanAfterDelay`).
+    /// `noteGlucoseReceived()`. A disconnect with this still `false` means the transmitter dropped
+    /// *before* delivering an EGV (pre-auth / pre-EGV), so the stock rescan after a link ended does
+    /// not wait the 2s post-EGV shutdown grace. Isolated to `managerQueue`.
     var receivedGlucoseSinceConnect: Bool = false
 
     /// C-210-6/7: the binding-scoped BLE recovery state, reset atomically on every binding change
@@ -193,6 +291,9 @@ class G7BluetoothManager: NSObject {
         var connectWedgeTicks: Int = 0
         /// True once `connect_wedge_persistent` has been emitted for the current wedge episode.
         var wedgePersistentEmitted = false
+        /// Start delay (s) carried by the connect the watchdog is watching, so a deliberately delayed
+        /// reconnect (see `reconnectStartDelay`) is not mistaken for a wedge before the delay ends.
+        var connectStartDelay: TimeInterval = 0
     }
     private var bindingState = BindingBLEState()
     /// Monotonic id bumped on every binding reset, captured by the delayed-retry closure so a stale
@@ -230,28 +331,61 @@ class G7BluetoothManager: NSObject {
     /// peripheral in `.connecting` forever — `connect()` has no timeout — and every later
     /// connectIfNotInFlight is skipped as in_flight (the build-211 multi-hour stall). Generous vs a
     /// healthy connect (< a few seconds), under the 5-min cadence so a slow-but-progressing connect
-    /// is not killed and a hang costs at most one cycle.
+    /// is not killed and a hang costs at most one cycle. A connect lodged with a start delay is
+    /// given that delay on top.
     private static let connectAttemptTimeout: TimeInterval = 60
     /// C-217 Task 4: minimum interval between `reinitCentral` calls — prevents a re-init loop when
     /// the wedge persists across central swaps.
     private static let centralReinitMinInterval: TimeInterval = 120
 
-    /// Called on `managerQueue` from `G7Sensor.handleGlucoseMessage` when a real-time EGV is parsed:
-    /// marks this connection as having delivered glucose and stamps the binding-scoped last-EGV time.
+    /// Called on `managerQueue` when a real-time EGV is parsed: marks this connection as having
+    /// delivered glucose and stamps the binding-scoped last-EGV time.
     func noteGlucoseReceived() {
         dispatchPrecondition(condition: .onQueue(managerQueue))
         receivedGlucoseSinceConnect = true
         bindingState.lastGlucoseAt = Date()
     }
 
+    /// Set while `reinitCentral` drops the peripheral manager, so the delegate is not told the sensor
+    /// was let go of (a watch's stored binding would be erased by it). Isolated to `managerQueue`.
+    private var suppressAdoptNotification = false
+
     // MARK: - Synchronization
 
-    private let managerQueue = DispatchQueue(label: "com.loudnate.CGMBLEKit.bluetoothManagerQueue", qos: .unspecified)
+    let managerQueue =DispatchQueue(label: "com.loudnate.CGMBLEKit.bluetoothManagerQueue", qos: .unspecified)
 
+    /// Whether a `.poweredOn` recheck is already pending. Confined to `managerQueue`.
+    private var poweredOnRecheckScheduled = false
+
+    /// Consecutive rechecks that still saw a non-`.poweredOn` state, and how
+    /// often we have rebuilt the central because of it. Confined to `managerQueue`.
+    private var poweredOnRecheckCount = 0
+    private var centralRecreationCount = 0
+
+    /// How long to tolerate a stuck state before rebuilding the central.
+    private static let poweredOnRecheckInterval: TimeInterval = 3
+    private static let poweredOnRechecksBeforeRecreating = 10
+    private static let maximumCentralRecreations = 5
+
+    /// The sensor advertises for other displays for ~20–24 s after closing a link; a connect into
+    /// that tail fails, and repeated failures make CoreBluetooth demand a very strong signal.
+    /// Whole seconds: CoreBluetooth rejects a fractional start delay as an invalid parameter.
+    static let reconnectStartDelay = 30
+
+    /// There is exactly one of these per session, and a pairing run borrows
+    /// it rather than building a second: only one central per app may claim
+    /// the restore identifier, and sharing the central is what lets the
+    /// session adopt the connection pairing just authenticated instead of
+    /// dropping it and waiting for the sensor's next advertisement.
     override init() {
         super.init()
 
         managerQueue.sync {
+            #if os(watchOS)
+            self.acquisitionArm = G7WatchAcquisition(manager: self)
+            #else
+            self.acquisitionArm = nil
+            #endif
             self.centralManager = self.makeCentralManager(queue: self.managerQueue)
         }
     }
@@ -265,41 +399,37 @@ class G7BluetoothManager: NSObject {
 
     // MARK: - Actions
 
+    // Fire-and-forget onto the manager queue, which keeps callers' order: a synchronous hop from
+    // the main thread can wait behind a multi-second handshake and trip the system watchdog.
     func scanForPeripheral() {
         dispatchPrecondition(condition: .notOnQueue(managerQueue))
 
-        managerQueue.sync {
+        managerQueue.async {
             self.managerQueue_scanForPeripheral()
         }
     }
 
+    /// Re-derives the watch's acquisition from the central's own state on a wake; nothing on the phone.
+    func recheckAcquisition() {
+        managerQueue.async {
+            guard self.delegate != nil, self.centralManager.state == .poweredOn,
+                  (self.activePeripheral?.state ?? .disconnected) != .connected else { return }
+            self.acquisitionArm?.recheck()
+        }
+    }
+
     func forgetPeripheral() {
-        managerQueue.sync {
+        managerQueue.async {
             self.activePeripheralManager = nil
             // C-210-6/7 (review A/B/C/D): binding reset. Reset binding-scoped recovery state in one
             // shot and bump the generation so any in-flight delayed retry from the prior binding no-ops;
             // drop stale managed peripherals so their late disconnect callbacks can't touch the new
-            // binding's connection state. Reached ONLY via scanForNewSensor (sensor swap / EOS /
-            // session-end), NOT from a normal disconnect(), so clearing managedPeripherals here does not
-            // skip a live-connection disconnect callback (review round 3, M-c).
+            // binding's connection state. Reached via scanForNewSensor (sensor swap / EOS /
+            // session-end) and pairing teardown, NOT from a normal disconnect().
             self.bindingState = BindingBLEState()
             self.bindingGeneration += 1
             self.managedPeripherals.removeAll()
             self.receivedGlucoseSinceConnect = false
-        }
-    }
-
-    func stopScanning() {
-        managerQueue.sync {
-            managerQueue_stopScanning()
-        }
-    }
-
-    private func managerQueue_stopScanning() {
-        if centralManager.isScanning {
-            log.default("Stopping scan")
-            centralManager.stopScan()
-            delegate?.bluetoothManagerScanningStatusDidChange(self)
         }
     }
 
@@ -312,22 +442,86 @@ class G7BluetoothManager: NSObject {
         }
     }
 
+    func stopScanning() {
+        managerQueue.async {
+            self.managerQueue_stopScanning()
+        }
+    }
+
+    func managerQueue_stopScanning() {
+        if centralManager.isScanning {
+            log.default("Stopping scan")
+            centralManager.stopScan()
+            delegate?.bluetoothManagerScanningStatusDidChange(self)
+        }
+    }
+
     func disconnect() {
+        dispatchPrecondition(condition: .notOnQueue(managerQueue))
+        managerQueue.async { self.managerQueue_disconnect() }
+    }
+
+    private func managerQueue_disconnect() {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        if centralManager.isScanning {
+            log.default("Stopping scan on disconnect")
+            centralManager.stopScan()
+            delegate?.bluetoothManagerScanningStatusDidChange(self)
+        }
+
+        if let peripheral = activePeripheral {
+            centralManager.cancelPeripheralConnection(peripheral)
+        }
+        // C-212-1 (review): an explicit disconnect is a stop — disarm the connect watchdog so it
+        // can't reissue a connect the caller intended to stop.
+        bindingState.connectIssuedAt = nil
+    }
+
+    /// A reading's own sensor timestamp, for the acquisition arm: each glucose message, and the
+    /// saved last reading at launch.
+    func noteReading(at readingTimestamp: Date) {
+        guard let arm = acquisitionArm else { return }
+        managerQueue.async { arm.noteReading(at: readingTimestamp) }
+    }
+
+    /// Makes `peripheralManager` the active peripheral, keeping its connection,
+    /// and drops every other managed peripheral. This is the hand-off at the
+    /// end of pairing: the candidate that authenticated becomes the session's
+    /// sensor without a disconnect in between.
+    func adoptAsActive(_ peripheralManager: G7PeripheralManager) {
         dispatchPrecondition(condition: .notOnQueue(managerQueue))
 
         managerQueue.sync {
-            if centralManager.isScanning {
-                log.default("Stopping scan on disconnect")
-                centralManager.stopScan()
-                delegate?.bluetoothManagerScanningStatusDidChange(self)
+            managerQueue_stopScanning()
+
+            for (identifier, other) in managedPeripherals where other !== peripheralManager {
+                centralManager.cancelPeripheralConnection(other.peripheral)
+                managedPeripherals.removeValue(forKey: identifier)
             }
 
-            if let peripheral = activePeripheral {
-                centralManager.cancelPeripheralConnection(peripheral)
+            if activePeripheralManager !== peripheralManager {
+                activePeripheralManager = peripheralManager
+                // Pairing candidates' connect attempts must not rate-gate the first reconnect after adoption.
+                bindingState.recentConnectIssueTimes = []
             }
-            // C-212-1 (review): an explicit disconnect is a stop — disarm the connect watchdog so it
-            // can't reissue a connect the caller intended to stop.
-            bindingState.connectIssuedAt = nil
+            peripheralManager.delegate = self
+            peripheralManager.reclaimPeripheral()
+            managedPeripherals[peripheralManager.peripheral.identifier] = peripheralManager
+        }
+    }
+
+    /// Cancels every managed peripheral's connection, not just the active one.
+    /// The pairing run needs this: its candidates are never made active (there
+    /// is no sensor ID yet), so `disconnect()` would leave them connected.
+    func disconnectAll() {
+        dispatchPrecondition(condition: .notOnQueue(managerQueue))
+
+        managerQueue.sync {
+            managerQueue_stopScanning()
+
+            for peripheralManager in managedPeripherals.values {
+                centralManager.cancelPeripheralConnection(peripheralManager.peripheral)
+            }
         }
     }
 
@@ -339,10 +533,10 @@ class G7BluetoothManager: NSObject {
             // following a sensor — the dominant state. For a bound sensor this routes through
             // `.makeActive` → `connectIfNotInFlight`, which is a no-op nudge when a pending
             // connect already exists; the value is the wake + observability.
-            // Verification finding: preserve the pre-208 discovery-mode behavior — when
-            // unbound, ANY connection event (incl. `.peerDisconnected`, i.e. another app just
-            // released the sensor's system connection) triggered discovery handling. For the
-            // bound case (new in 208), only `.peerConnected` attaches.
+            // Preserve the pre-208 discovery-mode behavior — when unbound, ANY connection event
+            // (incl. `.peerDisconnected`, i.e. another app just released the sensor's system
+            // connection) triggered discovery handling. For the bound case, only `.peerConnected`
+            // attaches.
             guard event == .peerConnected || self.activePeripheralIdentifier == nil else { return }
             emitG7Telemetry(
                 "connection_event",
@@ -367,12 +561,36 @@ class G7BluetoothManager: NSObject {
     private func managerQueue_scanForPeripheral() {
         dispatchPrecondition(condition: .onQueue(managerQueue))
 
-        guard centralManager.state == .poweredOn else {
+        // `didDisconnectPeripheral` always rescans, which keeps us alive for a
+        // couple of seconds past release. A pairing run that has finished must
+        // not start scanning again in that window: the sensor it just paired
+        // admits one display, and the session manager is claiming it.
+        guard delegate != nil else {
+            log.default("Not scanning: no delegate")
             return
         }
 
+        guard centralManager.state == .poweredOn else {
+            schedulePoweredOnRecheck()
+            return
+        }
+
+        poweredOnRecheckCount = 0
+
         let currentState = activePeripheral?.state ?? .disconnected
         guard currentState != .connected else {
+            log.default("Not scanning: active peripheral is connected")
+            return
+        }
+
+        if let arm = acquisitionArm {
+            arm.scan()
+            return
+        }
+
+        // Leave a pending (delayed) reconnect alone; a plain connect now could land in the advertising tail.
+        guard currentState != .connecting else {
+            log.default("Not scanning: active peripheral has a connect pending")
             return
         }
 
@@ -382,6 +600,9 @@ class G7BluetoothManager: NSObject {
             handleDiscoveredPeripheral(peripheral)
         } else {
             emitG7Telemetry("attach_path", "path=miss has_identifier=\(activePeripheralIdentifier != nil) \(rssiTelemetrySuffix())")
+            if let peripheralID = activePeripheralIdentifier {
+                log.default("Could not retrieve peripheral %{public}@; active peripheral %{public}@", peripheralID.uuidString, activePeripheral?.identifier.uuidString ?? "none")
+            }
             for peripheral in centralManager.retrieveConnectedPeripherals(withServices: [
                 SensorServiceUUID.advertisement.cbUUID,
                 SensorServiceUUID.cgmService.cbUUID
@@ -418,73 +639,93 @@ class G7BluetoothManager: NSObject {
      The sleep gives the transmitter time to shut down, but keeps the app running.
 
      */
-    fileprivate func scanAfterDelay() {
+    /// CoreBluetooth lies about its state at creation: a central built while
+    /// another is being torn down can report `.unknown` or even `.unsupported`
+    /// and then never send a corrective `didUpdateState`, leaving the manager
+    /// permanently convinced Bluetooth is unavailable. Poll our way out, and
+    /// rebuild the central if the state stays stuck.
+    private func schedulePoweredOnRecheck() {
         dispatchPrecondition(condition: .onQueue(managerQueue))
-        // C-207-2: the 2s grace lets the transmitter finish its normal between-reading shutdown AFTER
-        // it has delivered an EGV. But when the connection dropped BEFORE any glucose arrived this
-        // connection (pre-auth / pre-EGV remote disconnect — the dominant watch-background miss in
-        // build 206), the transmitter is likely still in its advertise/connection window; waiting 2s
-        // plus a full rescan can miss it and lose the reading. Rescan immediately in that case. Read
-        // the flag here (on `managerQueue`) before hopping to the utility queue.
-        let settleDelay: TimeInterval = receivedGlucoseSinceConnect ? 2 : 0
-        // C-208-15: observability only — makes the self-initiated rescan visible in telemetry
-        // (it was previously inferable only from its consequences). No control-flow change.
-        emitG7Telemetry("rescan_scheduled", "delay_s=\(Int(settleDelay)) had_glucose=\(receivedGlucoseSinceConnect)")
-        DispatchQueue.global(qos: .utility).async {
-            if settleDelay > 0 {
-                Thread.sleep(forTimeInterval: settleDelay)
+
+        guard !poweredOnRecheckScheduled, delegate != nil else {
+            return
+        }
+        poweredOnRecheckScheduled = true
+
+        managerQueue.asyncAfter(deadline: .now() + G7BluetoothManager.poweredOnRecheckInterval) { [weak self] in
+            guard let self = self else { return }
+            self.poweredOnRecheckScheduled = false
+
+            guard self.delegate != nil else {
+                return
             }
-            self.scanForPeripheral()
-        }
-    }
+            guard self.centralManager.state != .poweredOn else {
+                self.poweredOnRecheckCount = 0
+                self.managerQueue_scanForPeripheral()
+                return
+            }
 
-    // MARK: - Accessors
-
-    var isScanning: Bool {
-        dispatchPrecondition(condition: .notOnQueue(managerQueue))
-
-        var isScanning = false
-        managerQueue.sync {
-            isScanning = centralManager.isScanning
-        }
-        return isScanning
-    }
-
-    var isConnected: Bool {
-        dispatchPrecondition(condition: .notOnQueue(managerQueue))
-
-        var isConnected = false
-        managerQueue.sync {
-            isConnected = activePeripheral?.state == .connected
-        }
-        return isConnected
-    }
-
-    /// C-216-B / W-7a: public diagnostics snapshot, contracted with a parallel adapter change — see
-    /// `G7BLEDiagnosticsSnapshot`'s doc comment for the "unwatched pending connect" fingerprint this
-    /// exists to surface. Same `notOnQueue` + `managerQueue.sync` pattern as `isScanning`/`isConnected`.
-    func diagnosticsSnapshot() -> G7BLEDiagnosticsSnapshot {
-        dispatchPrecondition(condition: .notOnQueue(managerQueue))
-
-        var snapshot: G7BLEDiagnosticsSnapshot!
-        managerQueue.sync {
-            let connectPendingAgeS = bindingState.connectIssuedAt.map { Int(Date().timeIntervalSince($0)) }
-            let secondsSinceLastDiscover = lastDiscoverAt.map { Int(Date().timeIntervalSince($0)) }
-            snapshot = G7BLEDiagnosticsSnapshot(
-                centralStateRaw: centralManager.state.rawValue,
-                isScanning: centralManager.isScanning,
-                activePeripheralStateRaw: activePeripheral?.state.rawValue,
-                connectPendingAgeS: connectPendingAgeS,
-                secondsSinceLastDiscover: secondsSinceLastDiscover,
-                lastDiscoverRSSI: lastDiscoverRSSI
+            self.poweredOnRecheckCount += 1
+            self.log.default(
+                "Bluetooth still %{public}@ after %{public}d rechecks",
+                String(describing: self.centralManager.state.rawValue),
+                self.poweredOnRecheckCount
             )
+
+            let isStuckState = self.centralManager.state == .unknown || self.centralManager.state == .unsupported
+            if isStuckState,
+               self.poweredOnRecheckCount >= G7BluetoothManager.poweredOnRechecksBeforeRecreating,
+               self.centralRecreationCount < G7BluetoothManager.maximumCentralRecreations,
+               self.managedPeripherals.isEmpty
+            {
+                self.log.error("Recreating central manager stuck at %{public}@", String(describing: self.centralManager.state.rawValue))
+                self.centralRecreationCount += 1
+                self.poweredOnRecheckCount = 0
+                self.centralManager.delegate = nil
+                self.centralManager = self.makeCentralManager(queue: self.managerQueue)
+            }
+
+            self.schedulePoweredOnRecheck()
         }
-        return snapshot
+    }
+
+    /// Lodges the active peripheral's reconnect at once, so it stands even if the app is suspended,
+    /// with a start delay that lets the sensor's advertising tail pass first.
+    private func reconnectAfterAdvertisingTail(_ peripheral: CBPeripheral) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        reconnectLog("Reconnecting with a \(G7BluetoothManager.reconnectStartDelay) s start delay")
+        handleDiscoveredPeripheral(peripheral, connectOptions: [CBConnectPeripheralOptionStartDelayKey: NSNumber(value: G7BluetoothManager.reconnectStartDelay)])
+    }
+
+    /// To both the system log and the host's device log, so field reports show it.
+    private func reconnectLog(_ line: String) {
+        log.default("%{public}@", line)
+        delegate?.bluetoothManager(self, logEvent: line)
+    }
+
+    /// Stock path only (no arm): an active peripheral reconnects on its own; anything else rescans.
+    private func resumeAfterLinkEnded(_ peripheral: CBPeripheral) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+        guard peripheral == activePeripheral, centralManager.state == .poweredOn else {
+            // C-207-2: the 2s grace lets the transmitter finish its normal between-reading shutdown
+            // AFTER it has delivered an EGV. When the link dropped BEFORE any glucose arrived on it
+            // (pre-auth / pre-EGV), the transmitter is likely still in its advertise window, so
+            // rescan at once instead of waiting.
+            let settleDelay: TimeInterval = receivedGlucoseSinceConnect ? 2 : 0
+            // C-208-15: observability only — makes the self-initiated rescan visible in telemetry.
+            emitG7Telemetry("rescan_scheduled", "delay_s=\(Int(settleDelay)) had_glucose=\(receivedGlucoseSinceConnect)")
+            managerQueue.asyncAfter(deadline: .now() + settleDelay) { [weak self] in
+                self?.managerQueue_scanForPeripheral()
+            }
+            return
+        }
+        emitG7Telemetry("rescan_scheduled", "delay_s=\(G7BluetoothManager.reconnectStartDelay) had_glucose=\(receivedGlucoseSinceConnect) mode=start_delay")
+        reconnectAfterAdvertisingTail(peripheral)
     }
 
     /// C-216-A: shared `last_rssi=`/`rssi_age_s=` suffix for the `attach_path` and `connect_timeout`
     /// emits, so the sentinel values (127 = BT-spec "RSSI not available", -1 = "no discover yet")
-    /// are defined in exactly one place rather than repeated at each of the 5 call sites.
+    /// are defined in exactly one place rather than repeated at each call site.
     /// managerQueue-isolated (reads `lastDiscoverAt`/`lastDiscoverRSSI`).
     private func rssiTelemetrySuffix() -> String {
         dispatchPrecondition(condition: .onQueue(managerQueue))
@@ -497,8 +738,8 @@ class G7BluetoothManager: NSObject {
     /// connected. Discovery callbacks fan in from several paths (scan restart, connectionEvent,
     /// willRestoreState, didDiscover); without this guard each can stack a redundant
     /// `connect(peripheral)` on an already-in-flight connection. Skipped calls are recorded so the
-    /// dedup is observable in telemetry.
-    private func connectIfNotInFlight(_ peripheral: CBPeripheral) {
+    /// dedup is observable in telemetry. `options` carries the delayed-reconnect start delay.
+    private func connectIfNotInFlight(_ peripheral: CBPeripheral, options: [String: Any]? = nil) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
         guard peripheral.state != .connecting, peripheral.state != .connected else {
             emitG7Telemetry(
@@ -526,6 +767,8 @@ class G7BluetoothManager: NSObject {
                         bindingState.connectIssuedAt = Date()
                         bindingState.connectWedgeTicks = 0
                         bindingState.wedgePersistentEmitted = false
+                        // An adopted attempt may be a start-delayed reconnect lodged before a relaunch.
+                        bindingState.connectStartDelay = TimeInterval(G7BluetoothManager.reconnectStartDelay)
                         emitG7Telemetry("connect_watchdog_adopted", "scope=bound peripheral=\(peripheral.identifier.uuidString)")
                         scheduleConnectTimeout(peripheral)
                     }
@@ -557,13 +800,14 @@ class G7BluetoothManager: NSObject {
         bindingState.recentConnectIssueTimes.append(now)
         // C-207-2: a fresh connect attempt opens a new "did this connection deliver an EGV?" window.
         receivedGlucoseSinceConnect = false
-        centralManager.connect(peripheral)
+        centralManager.connect(peripheral, options: options)
         // C-212-1: arm a timeout for the active binding's connect so a wedged `.connecting` attempt
         // (no didConnect / didFailToConnect) can't stall recovery indefinitely. Active binding only.
         if peripheral.identifier == activePeripheralIdentifier {
             bindingState.connectIssuedAt = now
             bindingState.connectWedgeTicks = 0
             bindingState.wedgePersistentEmitted = false
+            bindingState.connectStartDelay = (options?[CBConnectPeripheralOptionStartDelayKey] as? NSNumber)?.doubleValue ?? 0
             scheduleConnectTimeout(peripheral)
         } else {
             // C-216-W7: close C-212-1's accepted limitation E — an unbound discovery-mode connect
@@ -602,10 +846,10 @@ class G7BluetoothManager: NSObject {
     }
 
     /// C-210-6: re-kick a proven zombie (guaranteed `.connected` by `shouldRekickBoundStalled`).
-    /// Cancelling the EGV-silent connection drives the existing disconnect -> `scanAfterDelay` ->
-    /// rescan path (immediate rescan, no glucose this connection), reconnecting onto the window the
-    /// connection event signalled. The reconnect is still subject to the C-210-7 gate, and the
-    /// `lastRekickAt` debounce bounds how often this can fire — so a persistent stall cannot storm.
+    /// Cancelling the EGV-silent connection drives the existing disconnect → `resumeAfterLinkEnded`
+    /// path, reconnecting onto the window the connection event signalled. The reconnect is still
+    /// subject to the C-210-7 gate, and the `lastRekickAt` debounce bounds how often this can fire —
+    /// so a persistent stall cannot storm.
     private func rekickBoundStalledPeripheral(_ peripheral: CBPeripheral) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
         // review round 4 (codex Medium): the connection-event peripheral can be a FRESH CBPeripheral
@@ -661,7 +905,8 @@ class G7BluetoothManager: NSObject {
     /// C-212-1: connect watchdog. `connect()` has no timeout, so a peripheral wedged in `.connecting`
     /// (no didConnect/didFailToConnect) would otherwise be skipped as in_flight by every later
     /// connectIfNotInFlight forever — the build-211 multi-hour in-flight stall. While the active
-    /// binding has a pending connect (connectIssuedAt set), re-check every `connectAttemptTimeout`:
+    /// binding has a pending connect (connectIssuedAt set), re-check every `connectAttemptTimeout`
+    /// (the first check also waits out a start-delayed reconnect's `connectStartDelay`):
     ///   - `.connecting` past the timeout → wedged: cancel and keep watching. Cancelling a pending
     ///     connect may fire NO delegate callback and CB clears state asynchronously, so we must not
     ///     rescan now (an immediate connectIfNotInFlight would skip as in_flight and re-wedge) — keep
@@ -682,7 +927,10 @@ class G7BluetoothManager: NSObject {
         let gen = bindingGeneration
         let pid = peripheral.identifier
         let issuedAt = bindingState.connectIssuedAt
-        managerQueue.asyncAfter(deadline: .now() + Self.connectAttemptTimeout) { [weak self] in
+        // Only the first tick after an issue carries the start delay; a re-armed tick follows a cancel
+        // + re-issue (which sets a fresh delay of its own) or a plain cancel-and-wait.
+        let startDelay = bindingState.connectWedgeTicks == 0 ? bindingState.connectStartDelay : 0
+        managerQueue.asyncAfter(deadline: .now() + Self.connectAttemptTimeout + startDelay) { [weak self] in
             guard let self else { return }
             guard self.bindingGeneration == gen,
                   self.activePeripheralIdentifier == pid,
@@ -769,20 +1017,24 @@ class G7BluetoothManager: NSObject {
         }
         managerQueue_stopScanning()
         centralManager.delegate = nil
-        // Nil-ing `activePeripheralManager` clears `activePeripheralIdentifier` via didSet — intended;
-        // the fresh central rediscovers the sensor via name filter on the next poweredOn scan path.
+        // Drop the wedged peripheral reference, but keep the binding's identifier: the fresh central
+        // retrieves the sensor by it on the next poweredOn scan path. The adoption callback is
+        // suppressed because upstream's delegate persists a nil adoption as "sensor let go of"
+        // (it would clear the stored peripheral identifier of a configured-by-another-controller sensor).
+        let boundIdentifier = activePeripheralIdentifier
         bindingState = BindingBLEState()
+        // Old central's daemon requests die with it; clear lodged state so relodge() on the new central isn't a no-op.
+        acquisitionArm?.radioDown()
         bindingGeneration += 1
         pendingDiscoveryConnects.removeAll()
         managedPeripherals.removeAll()
+        suppressAdoptNotification = true
         activePeripheralManager = nil
+        suppressAdoptNotification = false
+        lockedPeripheralIdentifier.value = boundIdentifier
         receivedGlucoseSinceConnect = false
         lastCentralReinitAt = Date()
-        centralManager = CBCentralManager(
-            delegate: self,
-            queue: managerQueue,
-            options: [CBCentralManagerOptionRestoreIdentifierKey: "com.loudnate.CGMBLEKit"]
-        )
+        centralManager = makeCentralManager(queue: managerQueue)
         return true
     }
 
@@ -840,11 +1092,67 @@ class G7BluetoothManager: NSObject {
         }
     }
 
-    private func handleDiscoveredPeripheral(_ peripheral: CBPeripheral) {
+    // MARK: - Accessors
+
+    var isScanning: Bool {
+        dispatchPrecondition(condition: .notOnQueue(managerQueue))
+
+        var isScanning = false
+        managerQueue.sync {
+            isScanning = centralManager.isScanning
+        }
+        return isScanning
+    }
+
+    var isConnected: Bool {
+        dispatchPrecondition(condition: .notOnQueue(managerQueue))
+
+        var isConnected = false
+        managerQueue.sync {
+            isConnected = activePeripheral?.state == .connected
+        }
+        return isConnected
+    }
+
+    /// C-216-B / W-7a: public diagnostics snapshot, contracted with a parallel adapter change — see
+    /// `G7BLEDiagnosticsSnapshot`'s doc comment for the "unwatched pending connect" fingerprint this
+    /// exists to surface. Same `notOnQueue` + `managerQueue.sync` pattern as `isScanning`/`isConnected`.
+    func diagnosticsSnapshot() -> G7BLEDiagnosticsSnapshot {
+        dispatchPrecondition(condition: .notOnQueue(managerQueue))
+
+        var snapshot: G7BLEDiagnosticsSnapshot!
+        managerQueue.sync {
+            let connectPendingAgeS = bindingState.connectIssuedAt.map { Int(Date().timeIntervalSince($0)) }
+            let secondsSinceLastDiscover = lastDiscoverAt.map { Int(Date().timeIntervalSince($0)) }
+            snapshot = G7BLEDiagnosticsSnapshot(
+                centralStateRaw: centralManager.state.rawValue,
+                isScanning: centralManager.isScanning,
+                activePeripheralStateRaw: activePeripheral?.state.rawValue,
+                connectPendingAgeS: connectPendingAgeS,
+                secondsSinceLastDiscover: secondsSinceLastDiscover,
+                lastDiscoverRSSI: lastDiscoverRSSI
+            )
+        }
+        return snapshot
+    }
+
+    /// The manager already attached to this peripheral, if there is one. A
+    /// candidate dropped from `managedPeripherals` on disconnect is still the
+    /// peripheral's delegate, and may still have a handshake running; a
+    /// second manager would take the delegate role from it, and its commands
+    /// would never hear back.
+    private func makeOrReusePeripheralManager(_ peripheral: CBPeripheral) -> G7PeripheralManager {
+        if let existing = peripheral.delegate as? G7PeripheralManager {
+            return existing
+        }
+        return G7PeripheralManager(peripheral: peripheral, configuration: .dexcomG7, centralManager: centralManager)
+    }
+
+    func handleDiscoveredPeripheral(_ peripheral: CBPeripheral, advertisementData: [String: Any] = [:], rssi: NSNumber = 127, connectOptions: [String: Any]? = nil) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
 
         if let delegate = delegate {
-            switch delegate.bluetoothManager(self, shouldConnectPeripheral: peripheral) {
+            switch delegate.bluetoothManager(self, shouldConnectPeripheral: peripheral, advertisementData: advertisementData, rssi: rssi) {
             case .makeActive:
                 log.default("Making peripheral active: %{public}@", peripheral.identifier.uuidString)
 
@@ -852,38 +1160,48 @@ class G7BluetoothManager: NSObject {
                 // the binding WITHOUT going through forgetPeripheral. Reset binding-scoped recovery
                 // state + bump the generation so prior-binding stall/throttle/retry state can't leak in
                 // and a pending gated-retry closure no-ops. Steady-state reconnects (same id) skip this.
-                if activePeripheral?.identifier != peripheral.identifier {
+                if activePeripheralIdentifier != peripheral.identifier {
                     bindingState = BindingBLEState()
                     bindingGeneration += 1
                 }
 
                 if let peripheralManager = activePeripheralManager {
+                    if peripheralManager.peripheral.identifier != peripheral.identifier {
+                        delegate.bluetoothManager(self, didAdoptPeripheral: peripheral.identifier)
+                    }
                     peripheralManager.peripheral = peripheral
                     // Swapping `.peripheral` on the existing manager does NOT fire the
                     // activePeripheralManager didSet that maintains activePeripheralIdentifier, so set it
                     // explicitly — otherwise the re-kick/retry guards compare against a stale UUID (M-a).
                     lockedPeripheralIdentifier.value = peripheral.identifier
                 } else {
-                    activePeripheralManager = G7PeripheralManager(
-                        peripheral: peripheral,
-                        configuration: .dexcomG7,
-                        centralManager: centralManager
-                    )
+                    activePeripheralManager = makeOrReusePeripheralManager(peripheral)
                     activePeripheralManager?.delegate = self
                 }
                 self.managedPeripherals[peripheral.identifier] = activePeripheralManager
-                self.connectIfNotInFlight(peripheral)
+                if let arm = acquisitionArm {
+                    arm.found(peripheral)
+                } else {
+                    self.connectIfNotInFlight(peripheral, options: connectOptions)
+                }
 
             case .connect:
-                log.default("Connecting to peripheral: %{public}@", peripheral.identifier.uuidString)
-                self.connectIfNotInFlight(peripheral)
-                let peripheralManager = G7PeripheralManager(
-                    peripheral: peripheral,
-                    configuration: .dexcomG7,
-                    centralManager: centralManager
-                )
-                peripheralManager.delegate = self
-                self.managedPeripherals[peripheral.identifier] = peripheralManager
+                // Pairing hears repeat advertisements from the same candidate;
+                // building a second manager for one peripheral leaves the first
+                // as an orphaned delegate and loses handshake traffic.
+                if let existingManager = self.managedPeripherals[peripheral.identifier] {
+                    existingManager.peripheral = peripheral
+                    if peripheral.state != .connected, peripheral.state != .connecting {
+                        log.default("Reconnecting to peripheral: %{public}@", peripheral.identifier.uuidString)
+                        self.connectIfNotInFlight(peripheral)
+                    }
+                } else {
+                    log.default("Connecting to peripheral: %{public}@", peripheral.identifier.uuidString)
+                    let peripheralManager = makeOrReusePeripheralManager(peripheral)
+                    peripheralManager.delegate = self
+                    self.managedPeripherals[peripheral.identifier] = peripheralManager
+                    self.connectIfNotInFlight(peripheral)
+                }
             case .ignore:
                 break
             }
@@ -929,23 +1247,29 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         case .resetting, .poweredOff, .unauthorized, .unknown, .unsupported:
             fallthrough
         @unknown default:
+            acquisitionArm?.radioDown()
             if central.isScanning {
                 log.default("Stopping scan on central not powered on")
                 central.stopScan()
-                delegate?.bluetoothManagerScanningStatusDidChange(self)
             }
         }
+        delegate?.bluetoothManagerScanningStatusDidChange(self)
     }
 
+    // A daemon-held connect relaunches the app for the link; this is where the relaunch hands it back.
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
+
+        guard delegate?.bluetoothManagerShouldAcceptRestoredPeripherals(self) ?? true else {
+            log.default("Ignoring restored peripherals: delegate is not accepting them")
+            return
+        }
 
         let restoredPeripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]
         // M2: make CB state restoration observable in telemetry. `willRestoreState` previously logged
         // only via OSLog (invisible to BetterStack), so whether watchOS ever relaunches us for BLE was
-        // unmeasurable. Emit a structured event so the entitlement question (P1) can be answered from data.
-        // C-217 Task 4: since_reinit_s + restored_ids observe restore-identifier reuse — a small
-        // since_reinit_s is the undocumented in-process replay; restored_ids shows wedged re-inheritance.
+        // unmeasurable. C-217 Task 4: since_reinit_s + restored_ids observe restore-identifier reuse — a
+        // small since_reinit_s is the undocumented in-process replay; restored_ids shows wedged re-inheritance.
         let restoredIdsStr: String
         if let peripherals = restoredPeripherals, !peripherals.isEmpty {
             restoredIdsStr = peripherals.map { $0.identifier.uuidString }.joined(separator: ",")
@@ -958,9 +1282,14 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         )
 
         if let peripherals = restoredPeripherals {
+            let line = "RESTORED by the system — relaunched for Bluetooth with \(peripherals.count) peripheral(s): "
+                + peripherals.map { "\($0.name ?? "unnamed") state=\($0.state.rawValue)" }.joined(separator: ", ")
+            log.default("%{public}@", line)
+            delegate?.bluetoothManager(self, logEvent: line)
             for peripheral in peripherals {
                 log.default("Restoring peripheral from state: %{public}@", peripheral.identifier.uuidString)
                 handleDiscoveredPeripheral(peripheral)
+                acquisitionArm?.restored(peripheral)
             }
         }
     }
@@ -978,7 +1307,7 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         emitG7Telemetry("did_discover", "peripheral=\(peripheral.identifier.uuidString) rssi=\(RSSI.intValue) bound=\(activePeripheralIdentifier != nil)")
 
         managerQueue.async {
-            self.handleDiscoveredPeripheral(peripheral)
+            self.handleDiscoveredPeripheral(peripheral, advertisementData: advertisementData, rssi: RSSI)
         }
     }
 
@@ -1002,6 +1331,7 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
             // `.connected` tick. A belated didConnect from a cancelled attempt must not disarm a newer
             // attempt's watchdog. (currentConnectionStartedAt stays the C-210-6 zombie clock.)
         }
+        acquisitionArm?.connected(peripheral)
 
         log.default("%{public}@: %{public}@", #function, peripheral)
 
@@ -1030,8 +1360,8 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         // C-212-1 (review #1): do NOT clear connectIssuedAt here. A belated callback from a CANCELLED
         // connect can arrive after the watchdog already re-issued a new connect; clearing the marker
         // then would kill the NEW attempt's watchdog and re-wedge. connectIssuedAt is owned by connect
-        // issue (set) and the watchdog (which clears it on a `.connected` tick); the scanAfterDelay()
-        // below reissues and overwrites it.
+        // issue (set) and the watchdog (which clears it on a `.connected` tick); the reconnect below
+        // reissues and overwrites it.
         log.default("%{public}@: %{public}@", #function, peripheral)
         // Ignore errors indicating the peripheral disconnected remotely, as that's expected behavior
         if let error = error as NSError?, CBError(_nsError: error).code != .peripheralDisconnected {
@@ -1055,7 +1385,8 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
             managedPeripherals.removeValue(forKey: peripheral.identifier)
         }
 
-        scanAfterDelay()
+        if acquisitionArm?.disconnected(peripheral, error: error) == true { return }
+        resumeAfterLinkEnded(peripheral)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
@@ -1076,21 +1407,24 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
             self.delegate?.bluetoothManager(self, readyingFailed: peripheralManager, with: error)
         }
 
+        if acquisitionArm?.failedToConnect(peripheral, error: error) == true { return }
+
         if peripheral != activePeripheral {
             managedPeripherals.removeValue(forKey: peripheral.identifier)
         }
 
-        scanAfterDelay()
+        resumeAfterLinkEnded(peripheral)
     }
 }
 
 
 extension G7BluetoothManager: G7PeripheralManagerDelegate {
     func peripheralManager(_ manager: G7PeripheralManager, didReadRSSI RSSI: NSNumber, error: Error?) {
-        // C-216-A: result of the opportunistic `readRSSI()` issued in `didConnect`. Telemetry-only —
-        // no state to update here (the discover-time sample in `lastDiscoverRSSI` is what
-        // `attach_path`/`connect_timeout` stamp).
+        // C-216-A: result of the opportunistic `readRSSI()` issued in `didConnect`. Telemetry plus
+        // the upstream forward — the discover-time sample in `lastDiscoverRSSI` is what
+        // `attach_path`/`connect_timeout` stamp.
         emitG7Telemetry("rssi_read", "value=\(RSSI.intValue) error=\(error?.localizedDescription ?? "nil")")
+        delegate?.bluetoothManager(self, peripheralManager: manager, didReadRSSI: RSSI, error: error)
     }
 
     func peripheralManagerDidUpdateName(_ manager: G7PeripheralManager) {
@@ -1108,7 +1442,9 @@ extension G7BluetoothManager: G7PeripheralManagerDelegate {
         }
 
         switch CGMServiceCharacteristicUUID(rawValue: characteristic.uuid.uuidString.uppercased()) {
-        case .none, .communication?:
+        case .none, .communication?, .certificate?:
+            // The certificate characteristic only carries handshake payloads,
+            // which the authenticator collects through an installed handler.
             return
         case .control?:
             self.delegate?.bluetoothManager(self, peripheralManager: manager, didReceiveControlResponse: value)

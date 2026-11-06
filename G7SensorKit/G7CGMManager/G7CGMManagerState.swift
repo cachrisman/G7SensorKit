@@ -6,8 +6,6 @@
 //  Copyright © 2022 LoopKit Authors. All rights reserved.
 //
 
-#if os(iOS)
-
 import Foundation
 import LoopKit
 
@@ -18,19 +16,136 @@ public struct G7CGMManagerState: RawRepresentable, Equatable {
     public var sensorID: String?
     public var activatedAt: Date?
     public var extendedVersion: ExtendedVersionMessage?
+    /// Firmware version and serial number, asked for once per sensor right
+    /// after the extended version. Only for display.
+    public var transmitterVersion: TransmitterVersionMessage?
     public var latestReading: G7GlucoseMessage?
     public var latestReadingTimestamp: Date?
     public var latestConnect: Date?
-    public var uploadReadings: Bool = true
+
     /// TRIO-094: opt-in active backfill request (0x59) on a sequence gap. Default off.
     public var requestMissedReadings: Bool = false
+
+    /// How readings are obtained from the sensor.
+    ///
+    /// Restored state written before direct pairing existed has no value
+    /// here, and defaulting those to `.eavesdropping` is what keeps an
+    /// in-progress session working across the upgrade: the user may not have
+    /// the pairing code for a sensor they already applied. Pairing switches
+    /// this to `.direct`.
+    public var sessionMode: G7SessionMode = .eavesdropping
+
+    /// Which of the sensor's display slots this manager takes.
+    public var displayType: G7DisplayType = .phone
+
+    /// The 4-digit code printed on the sensor applicator. Direct mode only.
+    /// Kept so a stale shared key can be recovered from without asking the
+    /// user again, and cleared whenever the sensor is forgotten: it is only
+    /// ever valid for the sensor it came with.
+    public var pairingCode: String?
+
+    /// The AES key derived by the pairing handshake. Direct mode only; while
+    /// it is present, reconnects skip the key exchange.
+    ///
+    /// This lives in the manager's plist state rather than the keychain,
+    /// matching how the rest of this state is persisted. It authenticates a
+    /// local Bluetooth link to a disposable sensor and grants nothing beyond
+    /// that sensor's own readings.
+    public var sharedKey: Data?
+
+    /// Whether the paired sensor proved itself genuine Dexcom, the g7sim
+    /// emulator, or could not be verified — determined at pairing from its
+    /// identity certificate and retained across reconnects.
+    public var sensorAuthenticity: G7SensorAuthenticity = .unverified
+
+    /// Whether the user has hidden the simulated-sensor settings warning.
+    /// Reset when a new sensor is paired so a freshly paired emulator always
+    /// warns once; hiding it afterwards is for development screenshots. The
+    /// per-reading HealthKit metadata still marks the data simulated.
+    public var simulatedSensorWarningSuppressed: Bool = false
+
+    /// The paired sensor's CoreBluetooth identifier, so a relaunch can
+    /// retrieve it directly instead of waiting for its next advertisement.
+    public var peripheralIdentifier: UUID?
+
+    /// Why the sensor last refused us, and when. Direct mode only. Without
+    /// this a refusal (another phone took the sensor's slot, say) is
+    /// indistinguishable from signal loss. Cleared by the next reading.
+    public var lastAuthenticationFailure: String?
+    public var lastAuthenticationFailureDate: Date?
+
+    /// Identifies the sensor and lifetime the session-timed alerts were last
+    /// scheduled for. Loop keeps those scheduled notifications across
+    /// relaunches, so they are only re-issued when this changes.
+    public var lifecycleAlertsScheduledFor: String?
+
+    /// The sensor a failure alert has already been raised for, so it fires
+    /// once per sensor rather than on every reading that repeats the state.
+    public var sensorFailedAlertIssuedFor: String?
+
+    /// The sensor a `sensorEnd` event has already been recorded for, so the
+    /// session is closed in Loop's history exactly once.
+    public var sensorEndRecordedFor: String?
+
+    /// The sensor whose `sensorStart` waits for its serial number, and since when.
+    public var sensorStartPendingFor: String?
+    public var sensorStartPendingSince: Date?
+
+    /// The state last recorded as a `sensorIssue`, and for which sensor; nil once glucose is reliable.
+    public var sensorIssueReportedFor: String?
+    public var reportedSensorIssue: String?
+
+    /// When this app paired with, or began following, the current sensor.
+    public var pairedAt: Date?
+
+    /// The current sensor's failure, if it has failed: the algorithm state
+    /// that said so, and when it was first seen.
+    public var sensorFailureMessage: String?
+    public var sensorFailedAt: Date?
+
+    /// The sensor before this one, kept until the next replacement.
+    public var previousSensor: G7SensorRecord?
+
+    /// The latest calibration entered for this sensor, and the sensor's last
+    /// account of its calibration state. Direct mode only.
+    public var calibration: G7CalibrationRecord?
+    public var calibrationBounds: G7CalibrationBoundsMessage?
+    public var calibrationBoundsDate: Date?
+
+    /// Dexcom Share upload: the account (its password is in the keychain),
+    /// what has been sent, and the last outcome. Nil when signed out.
+    public var shareUsername: String?
+    public var shareServer: G7ShareServer?
+    public var shareUploadedThrough: Date?
+    public var shareLastUploadAt: Date?
+    public var shareLastError: String?
+    public var shareLastErrorAt: Date?
+
     /// When a suspected session end started its grace period, or nil if none is
     /// pending. Persisted so a grace period survives app termination: the deferred
     /// scan is an in-memory work item, so without this a genuinely ended session
     /// would leave the manager tracking a sensor that will never advertise again.
     public var suspectedSessionEndAt: Date?
 
+    /// Built from another controller's export (DeviceConfigurationSharing): the sensor and its code
+    /// were passed in, so setup, pairing and the sensor's lifecycle belong to that controller.
+    var configuredByAnotherController: Bool = false
+
+    /// The user wants the watch to read this sensor itself (the Read on Apple Watch setting).
+    var watchDirectReadEnabled = false
+
     init() {
+    }
+
+    /// The subset of this state the sensor session needs to reach its sensor.
+    var sensorCredentials: G7SensorCredentials {
+        G7SensorCredentials(
+            sensorID: sensorID,
+            pairingCode: pairingCode,
+            sharedKey: sharedKey,
+            peripheralIdentifier: peripheralIdentifier,
+            configuredByAnotherController: configuredByAnotherController
+        )
     }
 
     public init(rawValue: RawValue) {
@@ -42,11 +157,49 @@ public struct G7CGMManagerState: RawRepresentable, Equatable {
         if let extendedVersionData = rawValue["extendedVersion"] as? Data {
             extendedVersion = ExtendedVersionMessage(data: extendedVersionData)
         }
+        if let transmitterVersionData = rawValue["transmitterVersion"] as? Data {
+            transmitterVersion = TransmitterVersionMessage(data: transmitterVersionData)
+        }
         self.latestReadingTimestamp = rawValue["latestReadingTimestamp"] as? Date
         self.latestConnect = rawValue["latestConnect"] as? Date
-        self.uploadReadings = rawValue["uploadReadings"] as? Bool ?? true
         self.requestMissedReadings = rawValue["requestMissedReadings"] as? Bool ?? false
+        self.sessionMode = (rawValue["sessionMode"] as? String).flatMap(G7SessionMode.init(rawValue:)) ?? .eavesdropping
+        self.displayType = (rawValue["displayType"] as? Int).flatMap { G7DisplayType(rawValue: UInt8(truncatingIfNeeded: $0)) } ?? .phone
+        self.pairingCode = rawValue["pairingCode"] as? String
+        self.sharedKey = rawValue["sharedKey"] as? Data
+        self.sensorAuthenticity = (rawValue["sensorAuthenticity"] as? String).flatMap(G7SensorAuthenticity.init(rawValue:)) ?? .unverified
+        self.simulatedSensorWarningSuppressed = rawValue["simulatedSensorWarningSuppressed"] as? Bool ?? false
+        self.peripheralIdentifier = (rawValue["peripheralIdentifier"] as? String).flatMap(UUID.init(uuidString:))
+        self.lastAuthenticationFailure = rawValue["lastAuthenticationFailure"] as? String
+        self.lastAuthenticationFailureDate = rawValue["lastAuthenticationFailureDate"] as? Date
+        self.lifecycleAlertsScheduledFor = rawValue["lifecycleAlertsScheduledFor"] as? String
+        self.sensorFailedAlertIssuedFor = rawValue["sensorFailedAlertIssuedFor"] as? String
+        self.sensorEndRecordedFor = rawValue["sensorEndRecordedFor"] as? String
+        self.sensorStartPendingFor = rawValue["sensorStartPendingFor"] as? String
+        self.sensorStartPendingSince = rawValue["sensorStartPendingSince"] as? Date
+        self.sensorIssueReportedFor = rawValue["sensorIssueReportedFor"] as? String
+        self.reportedSensorIssue = rawValue["reportedSensorIssue"] as? String
+        self.pairedAt = rawValue["pairedAt"] as? Date
+        self.sensorFailureMessage = rawValue["sensorFailureMessage"] as? String
+        self.sensorFailedAt = rawValue["sensorFailedAt"] as? Date
+        self.previousSensor = (rawValue["previousSensor"] as? G7SensorRecord.RawValue).flatMap(G7SensorRecord.init(rawValue:))
+        self.calibration = (rawValue["calibration"] as? G7CalibrationRecord.RawValue).flatMap(G7CalibrationRecord.init(rawValue:))
+        self.calibrationBounds = (rawValue["calibrationBounds"] as? Data).flatMap(G7CalibrationBoundsMessage.init(data:))
+        self.calibrationBoundsDate = rawValue["calibrationBoundsDate"] as? Date
+        self.shareUsername = rawValue["shareUsername"] as? String
+        self.shareServer = (rawValue["shareServer"] as? String).flatMap(G7ShareServer.init(rawValue:))
+        self.shareUploadedThrough = rawValue["shareUploadedThrough"] as? Date
+        self.shareLastUploadAt = rawValue["shareLastUploadAt"] as? Date
+        self.shareLastError = rawValue["shareLastError"] as? String
+        self.shareLastErrorAt = rawValue["shareLastErrorAt"] as? Date
         self.suspectedSessionEndAt = rawValue["suspectedSessionEndAt"] as? Date
+        self.configuredByAnotherController = rawValue["configuredByAnotherController"] as? Bool ?? false
+        self.watchDirectReadEnabled = rawValue["watchDirectReadEnabled"] as? Bool ?? false
+        // A manager passed its configuration reads directly: there is no session to eavesdrop on.
+        // Without a code it stands down until a new configuration brings one.
+        if configuredByAnotherController {
+            self.sessionMode = .direct
+        }
     }
 
     public var rawValue: RawValue {
@@ -55,13 +208,73 @@ public struct G7CGMManagerState: RawRepresentable, Equatable {
         rawValue["activatedAt"] = activatedAt
         rawValue["latestReading"] = latestReading?.data
         rawValue["extendedVersion"] = extendedVersion?.data
+        rawValue["transmitterVersion"] = transmitterVersion?.data
         rawValue["latestReadingTimestamp"] = latestReadingTimestamp
         rawValue["latestConnect"] = latestConnect
-        rawValue["uploadReadings"] = uploadReadings
         rawValue["requestMissedReadings"] = requestMissedReadings
+        rawValue["sessionMode"] = sessionMode.rawValue
+        rawValue["displayType"] = Int(displayType.rawValue)
+        rawValue["pairingCode"] = pairingCode
+        rawValue["sharedKey"] = sharedKey
+        rawValue["sensorAuthenticity"] = sensorAuthenticity.rawValue
+        rawValue["simulatedSensorWarningSuppressed"] = simulatedSensorWarningSuppressed
+        rawValue["peripheralIdentifier"] = peripheralIdentifier?.uuidString
+        rawValue["lastAuthenticationFailure"] = lastAuthenticationFailure
+        rawValue["lastAuthenticationFailureDate"] = lastAuthenticationFailureDate
+        rawValue["lifecycleAlertsScheduledFor"] = lifecycleAlertsScheduledFor
+        rawValue["sensorFailedAlertIssuedFor"] = sensorFailedAlertIssuedFor
+        rawValue["sensorEndRecordedFor"] = sensorEndRecordedFor
+        rawValue["sensorStartPendingFor"] = sensorStartPendingFor
+        rawValue["sensorStartPendingSince"] = sensorStartPendingSince
+        rawValue["sensorIssueReportedFor"] = sensorIssueReportedFor
+        rawValue["reportedSensorIssue"] = reportedSensorIssue
+        rawValue["pairedAt"] = pairedAt
+        rawValue["sensorFailureMessage"] = sensorFailureMessage
+        rawValue["sensorFailedAt"] = sensorFailedAt
+        rawValue["previousSensor"] = previousSensor?.rawValue
+        rawValue["calibration"] = calibration?.rawValue
+        rawValue["calibrationBounds"] = calibrationBounds?.data
+        rawValue["calibrationBoundsDate"] = calibrationBoundsDate
+        rawValue["shareUsername"] = shareUsername
+        rawValue["shareServer"] = shareServer?.rawValue
+        rawValue["shareUploadedThrough"] = shareUploadedThrough
+        rawValue["shareLastUploadAt"] = shareLastUploadAt
+        rawValue["shareLastError"] = shareLastError
+        rawValue["shareLastErrorAt"] = shareLastErrorAt
         rawValue["suspectedSessionEndAt"] = suspectedSessionEndAt
+        if watchDirectReadEnabled {
+            rawValue["watchDirectReadEnabled"] = true
+        }
+        if configuredByAnotherController {
+            rawValue["configuredByAnotherController"] = true
+        }
         return rawValue
     }
 }
 
-#endif
+extension G7CGMManagerState {
+    /// What another controller needs to read this sensor directly: its identity, activation and
+    /// pairing code. The link, key and readings are this controller's own.
+    var sharedState: RawValue {
+        var shared = G7CGMManagerState()
+        shared.sensorID = sensorID
+        shared.activatedAt = activatedAt
+        shared.pairingCode = pairingCode
+        return shared.rawValue
+    }
+
+    /// Another controller's shared state as a manager of its own, reading directly.
+    static func adopted(from shared: RawValue) -> G7CGMManagerState {
+        let passed = G7CGMManagerState(rawValue: shared)
+        var state = G7CGMManagerState()
+        state.sensorID = passed.sensorID
+        state.activatedAt = passed.activatedAt
+        state.pairingCode = passed.pairingCode
+        state.sessionMode = .direct
+        state.pairedAt = Date()
+        state.configuredByAnotherController = true
+        // The secondary (watch) slot, so it never takes the slot of the controller that passed it.
+        state.displayType = .watch
+        return state
+    }
+}

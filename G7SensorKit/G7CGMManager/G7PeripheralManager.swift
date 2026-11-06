@@ -39,18 +39,27 @@ class G7PeripheralManager: NSObject {
             // C-208-12: async, never sync. This didSet runs on `managerQueue` (the `.makeActive`
             // re-assign site); a `queue.sync` here can wedge against `runCommand`, which blocks
             // THIS queue while waiting for a CBPeripheralDelegate callback that only
-            // `managerQueue` can deliver — a lock-order inversion resolved only by the ~2s
-            // command timeout, freezing the BLE delegate queue inside the connect window.
-            // Stale-window coverage (verification-corrected): a block already queued at
-            // re-assign time can run before this async lands, seeing `needsConfiguration ==
-            // false` against the NEW peripheral. Protection there is `configureAndRun`'s
-            // read-site check (`peripheral.services == nil` forces reconfiguration for a fresh
-            // instance) plus characteristic lookups throwing `.unknownCharacteristic` for the
-            // cached-services residual — C3's retry covers the skip-on-config-failure case only.
+            // `managerQueue` can deliver — a lock-order inversion resolved only by the command
+            // timeout, freezing the BLE delegate queue inside the connect window.
+            // Stale-window coverage: a block already queued at re-assign time can run before this
+            // async lands, seeing `needsConfiguration == false` against the NEW peripheral.
+            // Protection there is `configureAndRun`'s read-site check (`peripheral.services == nil`
+            // forces reconfiguration for a fresh instance) plus characteristic lookups throwing
+            // `.unknownCharacteristic` for the cached-services residual — C3's retry covers the
+            // skip-on-config-failure case only.
             queue.async {
                 self.needsConfiguration = true
                 self.cancelConfigurationRetry() // C3: stale peripheral — drop the pending retry block
             }
+        }
+    }
+
+    /// Makes this manager the peripheral's delegate again, in case another
+    /// manager for the same peripheral took the role in the meantime.
+    func reclaimPeripheral() {
+        if peripheral.delegate !== self {
+            log.error("Reclaiming peripheral %{public}@ from %{public}@", peripheral, String(describing: peripheral.delegate))
+            peripheral.delegate = self
         }
     }
 
@@ -65,6 +74,14 @@ class G7PeripheralManager: NSObject {
 
     /// Any error surfaced during the active operation
     private var commandError: Error?
+
+    /// Persistent per-characteristic update handlers. The pairing handshake
+    /// installs these to collect streamed chunks, which the one-shot command
+    /// conditions cannot do: the sensor starts streaming on the certificate
+    /// characteristic before its acknowledgement lands on the authentication
+    /// characteristic, and acknowledgements themselves can arrive while our
+    /// own write is still pending. Guarded by `commandLock`.
+    private var valueUpdateHandlers: [CBUUID: (Data) -> Void] = [:]
 
     /// TRIO-094: label of the command currently inside `runCommand`; guarded by `commandLock`.
     private var currentCommandOp: String?
@@ -115,6 +132,15 @@ class G7PeripheralManager: NSObject {
         peripheral.delegate = self
 
         assertConfiguration()
+    }
+
+    /// Installs (or with a nil handler, removes) a persistent handler that
+    /// receives every value update for `characteristic`, ahead of the
+    /// unsolicited-notification path to the delegate.
+    func setValueUpdateHandler(for characteristic: CGMServiceCharacteristicUUID, handler: ((Data) -> Void)?) {
+        commandLock.lock()
+        valueUpdateHandlers[characteristic.cbUUID] = handler
+        commandLock.unlock()
     }
 
     func requestExtendedVersion() throws {
@@ -246,9 +272,7 @@ extension G7PeripheralManager {
                 // configuration can never complete delivers no EGVs; holding it open blocks
                 // re-attach until the transmitter gives up (observed as ~600s zombie
                 // connections on builds 204/205). Drop it and let the normal disconnect path
-                // re-attach. Shared iPhone+watch; this state has never been reached in 30d of
-                // telemetry on either platform (configure_retry_exhausted = 0), so this is
-                // fail-safe insurance: it only acts where today's behavior is strictly worse.
+                // re-attach.
                 emitG7Telemetry(
                     "configure_retry_exhausted",
                     "attempts=\(self.configurationRetryAttempts) action=disconnect"
@@ -324,11 +348,15 @@ extension G7PeripheralManager {
 
         for (serviceUUID, characteristicUUIDs) in configuration.notifyingCharacteristics {
             guard let service = peripheral.services?.itemWithUUID(serviceUUID) else {
+                // Log what discovery returned: an empty or partial inventory means the link dropped
+                // mid-discovery, a full but different one means unexpected GATT.
+                log.error("unknownCharacteristic: service %{public}@ MISSING on %{public}@ — discovered: %{public}@", String(serviceUUID.uuidString.prefix(8)), peripheral.name ?? "unnamed", Self.gattInventory(peripheral))
                 throw PeripheralManagerError.unknownCharacteristic
             }
 
             for characteristicUUID in characteristicUUIDs {
                 guard let characteristic = service.characteristics?.itemWithUUID(characteristicUUID) else {
+                    log.error("unknownCharacteristic: char %{public}@ MISSING in service %{public}@ on %{public}@ — discovered: %{public}@", String(characteristicUUID.uuidString.prefix(8)), String(serviceUUID.uuidString.prefix(8)), peripheral.name ?? "unnamed", Self.gattInventory(peripheral))
                     throw PeripheralManagerError.unknownCharacteristic
                 }
 
@@ -339,6 +367,17 @@ extension G7PeripheralManager {
                 try setNotifyValue(true, for: characteristic, timeout: discoveryTimeout)
             }
         }
+    }
+
+    /// One-line GATT inventory — "svc(8chars):[char8,char8] | svc:[...]".
+    /// nil services = discovery never completed at all.
+    static func gattInventory(_ peripheral: CBPeripheral) -> String {
+        guard let services = peripheral.services else { return "NO SERVICES (discovery incomplete)" }
+        if services.isEmpty { return "0 services" }
+        return services.map { svc in
+            let chars = svc.characteristics?.map { String($0.uuid.uuidString.prefix(8)) }.joined(separator: ",") ?? "none-discovered"
+            return "\(svc.uuid.uuidString.prefix(8)):[\(chars)]"
+        }.joined(separator: " | ")
     }
 }
 
@@ -428,8 +467,7 @@ extension G7PeripheralManager {
         guard signaled else {
             // C-216-W1a: stamp the CB states at the moment of timeout so a dead-link timeout
             // (peripheral no longer `.connected`) can be told apart from a starved-CPU timeout
-            // (still `.connected`, callback just never ran) — the distinction build 217 needs
-            // before raising the 2s default.
+            // (still `.connected`, callback just never ran).
             emitG7Telemetry("command_timeout", "op=\(op) timeout_s=\(Int(timeout)) peripheral_state=\(peripheral.state.rawValue) central_state=\(central?.state.rawValue ?? -1)")
             throw PeripheralManagerError.timeout
         }
@@ -556,6 +594,8 @@ extension G7PeripheralManager {
             return "backfill"
         case .communication:
             return "communication"
+        case .certificate:
+            return "certificate"
         }
     }
 }
@@ -606,14 +646,31 @@ extension G7PeripheralManager: CBPeripheralDelegate {
         commandLock.unlock()
     }
 
+    /// Logs an update's error, which the command machinery otherwise drops. watchOS reports its
+    /// background-runtime budget here (WWDC22 10135): CBError 18 = near the limit, 17 = exceeded.
+    private func reportGattError(_ error: Error?, during what: String, on characteristic: CBCharacteristic) {
+        guard let error = error else { return }
+        let ns = error as NSError
+        var tag = ""
+        if ns.domain == CBErrorDomain {
+            switch ns.code {
+            case 18: tag = " — NEAR the watchOS background-notification limit (CBError 18); the next background wake may be the last before the reset"
+            case 17: tag = " — EXCEEDED the watchOS background-notification limit (CBError 17); no background BLE runtime until the user interacts with the app or 24 h pass"
+            default: break
+            }
+        }
+        log.error("[gatt] %{public}@ error on %{public}@ — %{public}@ (%{public}@#%d)%{public}@", what, characteristic.uuid.uuidString, error.localizedDescription, ns.domain, ns.code, tag)
+    }
+
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        reportGattError(error, during: "notification-state update", on: characteristic)
         commandLock.lock()
 
-        // A failed enable leaves isNotifying unchanged, so match on the UUID when the callback carries an error,
-        // so the error is surfaced instead of waiting out the timeout (TRIO-093 review).
+        // On an error the state does not change, so match the characteristic
+        // alone; otherwise the error is lost and the command only times out.
         if let index = commandConditions.firstIndex(where: { (condition) -> Bool in
-            if case .notificationStateUpdate(characteristicUUID: let uuid, enabled: let enabled) = condition {
-                return uuid == characteristic.uuid && (error != nil || enabled == characteristic.isNotifying)
+            if case .notificationStateUpdate(characteristicUUID: characteristic.uuid, enabled: let enabled) = condition {
+                return error != nil || enabled == characteristic.isNotifying
             } else {
                 return false
             }
@@ -651,9 +708,11 @@ extension G7PeripheralManager: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        reportGattError(error, during: "value update", on: characteristic)
         commandLock.lock()
 
         var notifyDelegate = false
+        var streamedValue: (handler: (Data) -> Void, value: Data)?
         var unmatchedWhilePending: (op: String, n: Int)?
 
         if let index = commandConditions.firstIndex(where: { (condition) -> Bool in
@@ -669,10 +728,20 @@ extension G7PeripheralManager: CBPeripheralDelegate {
             if commandConditions.isEmpty {
                 commandLock.broadcast()
             }
+        } else if let handler = valueUpdateHandlers[characteristic.uuid], let value = characteristic.value {
+            // Deliberately ahead of the `commandConditions.isEmpty` gate below:
+            // handshake traffic arrives while our own writes are still pending,
+            // and dropping it there is what an installed handler exists to avoid.
+            streamedValue = (handler, value) // execute after the unlock
         } else if let macro = configuration.valueUpdateMacros[characteristic.uuid] {
             macro(self)
         } else {
-            // TRIO-094: upstream LoopKit 764e002 delivers unconditionally: a pending write threw the glucose reply away ("Seen in the field as signal loss").
+            // Unconditionally, pending command or not. The sensor answers a
+            // control write with a notification a moment after the write
+            // response, and if the next write (a backfill request) is already
+            // in flight by then, gating on "no command pending" threw the
+            // glucose reply away. Seen in the field as signal loss while the
+            // sensor connected on schedule every five minutes.
             notifyDelegate = true // execute after the unlock
             if !commandConditions.isEmpty {
                 let n = lockedUnmatchedWhilePendingCount.mutate { $0 += 1 }
@@ -681,6 +750,10 @@ extension G7PeripheralManager: CBPeripheralDelegate {
         }
 
         commandLock.unlock()
+
+        if let streamedValue = streamedValue {
+            streamedValue.handler(streamedValue.value)
+        }
 
         if let (pendingOp, n) = unmatchedWhilePending {
             // TRIO-094: control and authentication always emit; the 20-byte burst stream (~600 packets) is capped at 3 per connection.
