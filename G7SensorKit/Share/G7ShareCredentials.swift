@@ -4,6 +4,7 @@
 //
 //  Copyright © 2026 LoopKit Authors. All rights reserved.
 //
+#if os(iOS)
 
 import Foundation
 import Security
@@ -102,3 +103,5 @@ struct G7ShareCredentialStore {
         SecItemDelete(query as CFDictionary)
     }
 }
+
+#endif

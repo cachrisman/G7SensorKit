@@ -8,8 +8,15 @@
 
 import Foundation
 import CoreBluetooth
+#if os(iOS)
 import LoopKit
+#endif
 import os.log
+
+#if !os(iOS)
+// watchOS builds without LoopKit; stand-in for LoopKit.DeviceLogEntryType so logToDevice call sites compile
+enum DeviceLogEntryType { case send, receive, error, delegate, delegateResponse, connection }
+#endif
 
 
 /// Delegate for `G7Sensor` events.
@@ -47,7 +54,9 @@ public protocol G7SensorDelegate: AnyObject {
 
     /// A device-log entry of the given type: sends as hex, connection events,
     /// handshake narration. Mirrors what the pump plugins record.
+    #if os(iOS)
     func sensor(_ sensor: G7Sensor, log message: String, type: DeviceLogEntryType)
+    #endif
 
     func sensor(_ sensor: G7Sensor, didRead glucose: G7GlucoseMessage)
 
@@ -415,9 +424,11 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
     }
 
     private func logToDevice(_ message: String, type: DeviceLogEntryType) {
+        #if os(iOS)
         delegateQueue.async {
             self.delegate?.sensor(self, log: message, type: type)
         }
+        #endif
     }
 
     private func logSend(_ data: Data, on characteristic: CGMServiceCharacteristicUUID) {
@@ -1471,7 +1482,9 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
             emitG7Telemetry("scanning_status_changed", "scanning=\(scanning)")
         }
         self.delegateQueue.async {
+            #if os(iOS)
             self.delegate?.sensor(self, log: manager.isScanning ? "Scanning for sensor" : "Stopped scanning", type: .connection)
+            #endif
             self.delegate?.sensorConnectionStatusDidUpdate(self)
         }
     }

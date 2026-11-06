@@ -9,6 +9,7 @@
 //  nightscout/share2nightscout-bridge, and the error codes the service
 //  returns to xDrip and xdripswift).
 //
+#if os(iOS)
 
 import Foundation
 import LoopKit
@@ -260,3 +261,5 @@ public final class G7ShareClient {
         _ = try await send(path, query: query, body: body)
     }
 }
+
+#endif

@@ -5,6 +5,8 @@
 //  Copyright © 2026 LoopKit Authors. All rights reserved.
 //
 
+#if os(iOS)
+
 import Foundation
 import LoopKit
 
@@ -144,3 +146,5 @@ enum G7LifecycleAlertSchedule {
         return delays
     }
 }
+
+#endif

@@ -132,12 +132,14 @@ public final class G7PairingService {
     private var candidateWatchdog: DispatchWorkItem?
     private var authenticationWatchdog: DispatchWorkItem?
 
+    #if os(iOS)
     /// - Parameter cgmManager: the manager being re-paired, if any. Its
     ///   session's central is borrowed for the run; with none, the run
     ///   creates the central the new session will adopt.
     public convenience init(cgmManager: G7CGMManager?, displayType: G7DisplayType = .phone) {
         self.init(bluetoothManager: cgmManager?.sensor.bluetoothManager, displayType: cgmManager?.displayType ?? displayType)
     }
+    #endif
 
     init(bluetoothManager: G7BluetoothManager?, displayType: G7DisplayType = .phone) {
         borrowedBluetoothManager = bluetoothManager

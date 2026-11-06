@@ -11,7 +11,9 @@
 //
 
 import Foundation
+#if os(iOS)
 import LoopKit
+#endif
 
 public struct G7GlucoseMessage: SensorMessage, Equatable {
     /// Nonzero when the sensor has no current reading, e.g. 0x80 from a failed sensor; glucose is then nil.
@@ -40,6 +42,7 @@ public struct G7GlucoseMessage: SensorMessage, Equatable {
     /// drawn as a confident triple arrow.
     public static let maximumTrendRateForArrow = 8.0
 
+#if os(iOS)
     public var trendType: LoopKit.GlucoseTrend? {
         guard let trend = trend, abs(trend) <= G7GlucoseMessage.maximumTrendRateForArrow else {
             return nil
@@ -76,6 +79,7 @@ public struct G7GlucoseMessage: SensorMessage, Equatable {
             return nil
         }
     }
+#endif
 
     init?(data: Data) {
         //    0  1  2 3 4 5  6 7  8  9 1011 1213 14 15 1617 18

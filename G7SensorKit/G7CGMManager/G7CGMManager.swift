@@ -6,6 +6,8 @@
 //  Copyright © 2022 LoopKit Authors. All rights reserved.
 //
 
+#if os(iOS)
+
 import Foundation
 import HealthKit
 import LoopKit
@@ -1487,3 +1489,5 @@ extension G7CGMManager: DeviceConfigurationSharing {
     public var isConfigurationSharingEnabled: Bool { isWatchDirectReadEnabled }
 
 }
+
+#endif

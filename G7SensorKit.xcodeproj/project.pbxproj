@@ -143,7 +143,7 @@
 		C1E71720292D84FE00DA646F /* G7ProgressBarState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1E7171F292D84FE00DA646F /* G7ProgressBarState.swift */; };
 		FADE00000000000000000335 /* G7GlucoseMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = C17F50E8291EAC6500555EB5 /* G7GlucoseMessage.swift */; };
 		FC325E86CDFE4002B0A5C260 /* G7P256Field.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F713A6F599C418A89815F3F /* G7P256Field.swift */; };
-		FADE00000000000000000311 /* LoopKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FADE00000000000000000301 /* LoopKit.framework */; };
+		FADE00000000000000000342 /* G7Telemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54A120762FA937D100AB0BE8 /* G7Telemetry.swift */; };
 		CF8E76B21D92A5ED046EBA26 /* G7Advertisement.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14C635B2D3F90E42F5907A39 /* G7Advertisement.swift */; };
 		D2F6C2D8999636C3D4F31DB1 /* G7AdvertisementTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 742542EDF25C573BA2E8B09A /* G7AdvertisementTests.swift */; };
 		D3CEBAE892F7B88160295F5F /* G7CalibrationRecord.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BA8EE3244D1FE42461E792D /* G7CalibrationRecord.swift */; };
@@ -369,7 +369,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				FADE00000000000000000311 /* LoopKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -926,6 +925,7 @@
 				FADE00000000000000000334 /* G7Sensor.swift in Sources */,
 				FADE00000000000000000335 /* G7GlucoseMessage.swift in Sources */,
 				FADE00000000000000000336 /* G7PeripheralManager.swift in Sources */,
+				FADE00000000000000000342 /* G7Telemetry.swift in Sources */,
 				7366CC457A99F38B86650E82 /* G7AES.swift in Sources */,
 				A81C38F7D576CAC101D24E56 /* G7BigUInt.swift in Sources */,
 				8BE83EC9A5E8C9919FC1A8AC /* G7ChallengeSigner.swift in Sources */,
@@ -1344,7 +1344,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator watchos watchsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -1381,7 +1381,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator watchos watchsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;

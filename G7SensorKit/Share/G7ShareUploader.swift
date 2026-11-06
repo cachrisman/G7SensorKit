@@ -5,6 +5,8 @@
 //  Copyright © 2026 LoopKit Authors. All rights reserved.
 //
 
+#if os(iOS)
+
 import Foundation
 import os.log
 
@@ -192,3 +194,5 @@ final class G7ShareUploader {
         }
     }
 }
+
+#endif
