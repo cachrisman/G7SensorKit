@@ -300,6 +300,10 @@ class G7BluetoothManager: NSObject {
     /// could not run at `willRestoreState` because the central was not yet `.poweredOn`. Consumed
     /// (and always cleared) at the next `.poweredOn`. managerQueue-isolated.
     private var pendingRestoredConnectedResume: UUID?
+    /// TRIO-101: restored peripherals whose stale-connect cancel could not run at `willRestoreState`
+    /// because the central was not yet `.poweredOn` (CoreBluetooth ignores the cancel then). Consumed
+    /// (and always cleared) at the next `.poweredOn`; replaced on each restore. managerQueue-isolated.
+    private var pendingStaleRestoredCancels: [CBPeripheral] = []
     /// Monotonic id bumped on every binding reset, captured by the delayed-retry closure so a stale
     /// closure from a prior binding no-ops instead of clearing the NEW binding's retry flag (review B).
     private var bindingGeneration = 0
@@ -777,6 +781,16 @@ class G7BluetoothManager: NSObject {
     /// auth and the session. True only for watchOS + no arm + active binding + `.connected`.
     static func shouldResumeRestoredConnected(isWatchOS: Bool, armActive: Bool, isActivePeripheral: Bool, state: CBPeripheralState) -> Bool {
         return isWatchOS && !armActive && isActivePeripheral && state == .connected
+    }
+
+    /// TRIO-101: whether a restored peripheral is a stale pending connect to cancel. Every relaunch
+    /// restores ~8 `.connecting` connects to old, expired sensors that nothing ever cancels. True only
+    /// with an active binding, for a peripheral that is not the active one, is `.connecting`, and was
+    /// declined by the delegate (so neither managed nor pending discovery: adopted peripherals, i.e.
+    /// the active sensor and a new sensor being paired or discovered, are always one or the other).
+    /// Never cancels a connect we still want.
+    static func shouldCancelStaleRestoredConnect(hasActiveBinding: Bool, isActivePeripheral: Bool, state: CBPeripheralState, isManaged: Bool, isPendingDiscovery: Bool) -> Bool {
+        return hasActiveBinding && !isActivePeripheral && state == .connecting && !isManaged && !isPendingDiscovery
     }
 
     /// Chooses the reconnect mode by WHY the link ended (TRIO-101).
@@ -1412,6 +1426,13 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
                     emitG7Telemetry("restored_connected_resume_skipped", "reason=not_active peripheral=\(pendingResume.uuidString)")
                 }
             }
+            // TRIO-101: stale restored connects deferred from willRestoreState (cancel is ignored
+            // before .poweredOn). Always clear so a later poweredOn cannot act on a stale list.
+            let pendingCancels = pendingStaleRestoredCancels
+            pendingStaleRestoredCancels = []
+            if !pendingCancels.isEmpty {
+                cancelStaleRestoredConnects(pendingCancels, timing: "powered_on")
+            }
             managerQueue_scanForPeripheral()
         case .resetting, .poweredOff, .unauthorized, .unknown, .unsupported:
             fallthrough
@@ -1485,6 +1506,48 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
                     pendingRestoredConnectedResume = peripheral.identifier
                 }
             }
+
+            // TRIO-101: cancel restored connects to peripherals the delegate declined (old, expired
+            // sensors). The arm manages its own restored connects, so stock path only. A belated
+            // didDisconnect/didFailToConnect for these is harmless: not active and not managed, they
+            // reach only resumeAfterLinkEnded's rescan, which managerQueue_scanForPeripheral gates.
+            // CoreBluetooth ignores cancelPeripheralConnection unless the central is .poweredOn, and
+            // willRestoreState precedes poweredOn — so cancel now only if the radio is already on,
+            // otherwise defer to poweredOn.
+            if acquisitionArm == nil {
+                if central.state == .poweredOn {
+                    cancelStaleRestoredConnects(peripherals, timing: "immediate")
+                } else {
+                    pendingStaleRestoredCancels = peripherals
+                }
+            }
+        }
+    }
+
+    /// TRIO-101: cancels restored connects to peripherals the delegate declined. Re-evaluates the
+    /// predicate at run time (state may have changed since restore). Stock path only.
+    private func cancelStaleRestoredConnects(_ peripherals: [CBPeripheral], timing: String) {
+        dispatchPrecondition(condition: .onQueue(managerQueue))
+
+        guard acquisitionArm == nil else { return }
+
+        var cancelled = 0
+        for peripheral in peripherals {
+            let id = peripheral.identifier
+            if Self.shouldCancelStaleRestoredConnect(
+                hasActiveBinding: activePeripheralIdentifier != nil,
+                isActivePeripheral: id == activePeripheralIdentifier,
+                state: peripheral.state,
+                isManaged: managedPeripherals[id] != nil,
+                isPendingDiscovery: pendingDiscoveryConnects[id] != nil
+            ) {
+                centralManager.cancelPeripheralConnection(peripheral)
+                cancelled += 1
+                emitG7Telemetry("restored_stale_connect_cancelled", "peripheral=\(id.uuidString) name=\(peripheral.name ?? "unnamed") timing=\(timing)")
+            }
+        }
+        if cancelled > 0 {
+            emitG7Telemetry("restored_stale_connects", "cancelled=\(cancelled) restored=\(peripherals.count) timing=\(timing)")
         }
     }
 

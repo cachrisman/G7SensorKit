@@ -407,3 +407,41 @@ final class G7RestoredConnectedResumeTests: XCTestCase {
         XCTAssertFalse(G7BluetoothManager.shouldResumeRestoredConnected(isWatchOS: true, armActive: true, isActivePeripheral: true, state: .connected))
     }
 }
+
+/// TRIO-101: stale restored `.connecting` connects are cancelled only when the delegate declined them.
+final class G7StaleRestoredConnectTests: XCTestCase {
+    private func decide(
+        binding: Bool = true, active: Bool = false, state: CBPeripheralState = .connecting,
+        managed: Bool = false, pending: Bool = false
+    ) -> Bool {
+        G7BluetoothManager.shouldCancelStaleRestoredConnect(
+            hasActiveBinding: binding, isActivePeripheral: active, state: state, isManaged: managed, isPendingDiscovery: pending
+        )
+    }
+
+    func testCancelsDeclinedConnecting() {
+        XCTAssertTrue(decide())
+    }
+
+    func testNoActiveBindingKeeps() {
+        XCTAssertFalse(decide(binding: false))
+    }
+
+    func testActivePeripheralKeeps() {
+        XCTAssertFalse(decide(active: true))
+    }
+
+    func testNonConnectingStatesKeep() {
+        for state: CBPeripheralState in [.disconnected, .connected, .disconnecting] {
+            XCTAssertFalse(decide(state: state), "state=\(state.rawValue)")
+        }
+    }
+
+    func testManagedKeeps() {
+        XCTAssertFalse(decide(managed: true))
+    }
+
+    func testPendingDiscoveryKeeps() {
+        XCTAssertFalse(decide(pending: true))
+    }
+}
