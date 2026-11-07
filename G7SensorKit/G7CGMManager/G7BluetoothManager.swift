@@ -329,11 +329,50 @@ class G7BluetoothManager: NSObject {
     private static let rekickMinInterval: TimeInterval = 300
     /// C-212-1: a connect attempt that never reaches `.connected` (and never fails) wedges the
     /// peripheral in `.connecting` forever — `connect()` has no timeout — and every later
-    /// connectIfNotInFlight is skipped as in_flight (the build-211 multi-hour stall). Generous vs a
-    /// healthy connect (< a few seconds), under the 5-min cadence so a slow-but-progressing connect
-    /// is not killed and a hang costs at most one cycle. A connect lodged with a start delay is
-    /// given that delay on top.
-    private static let connectAttemptTimeout: TimeInterval = 60
+    /// connectIfNotInFlight is skipped as in_flight (the build-211 multi-hour stall).
+    /// TRIO-101: the G7 sensor only wakes and advertises every 300 s, so a healthy pending connect
+    /// legitimately sits in `.connecting` for up to one full sensor period. The timeout must therefore
+    /// exceed that period: 300 s + a 30 s margin. The old 60 s value (justified as "under the 5-min
+    /// cadence") fired on every healthy pending connect and, when it fired late at the instant the
+    /// sensor's didConnect woke a suspended app, cancelled the live link (build 236 field data). A
+    /// connect lodged with a start delay is given that delay on top.
+    static let connectAttemptTimeout: TimeInterval = 330
+    /// TRIO-101: a watchdog tick this much later than its intended deadline means the process was
+    /// very likely suspended and has just been woken (often by this very connection completing).
+    static let connectWatchdogLateTickThreshold: TimeInterval = 10
+    /// TRIO-101: delay of the single re-check that follows a deferred late tick.
+    static let connectWatchdogRecheckDelay: TimeInterval = 3
+
+    /// TRIO-101: what a connect-watchdog tick should do.
+    enum ConnectWatchdogAction: Equatable {
+        case deferRecheck, cancelAndRewatch, escalate, rewatch, reissue, settled
+    }
+
+    /// TRIO-101: pure decision shared by the bound (C-212-1) and discovery (C-216-W7) watchdogs.
+    /// A `.connecting` tick that is late (> threshold) and not already a re-check is deferred rather
+    /// than cancelled; the re-check (`alreadyDeferred`) never defers again.
+    static func connectWatchdogAction(
+        state: CBPeripheralState,
+        lateness: TimeInterval,
+        alreadyDeferred: Bool,
+        wedgeTicksAfterThisTick: Int,
+        escalationEnabled: Bool
+    ) -> ConnectWatchdogAction {
+        switch state {
+        case .connecting:
+            if lateness > connectWatchdogLateTickThreshold, !alreadyDeferred { return .deferRecheck }
+            if wedgeTicksAfterThisTick >= 2, escalationEnabled { return .escalate }
+            return .cancelAndRewatch
+        case .disconnecting:
+            return .rewatch
+        case .disconnected:
+            return .reissue
+        case .connected:
+            return .settled
+        @unknown default:
+            return .settled
+        }
+    }
     /// C-217 Task 4: minimum interval between `reinitCentral` calls — prevents a re-init loop when
     /// the wedge persists across central swaps.
     private static let centralReinitMinInterval: TimeInterval = 120
@@ -908,7 +947,7 @@ class G7BluetoothManager: NSObject {
     /// (no didConnect/didFailToConnect) would otherwise be skipped as in_flight by every later
     /// connectIfNotInFlight forever — the build-211 multi-hour in-flight stall. While the active
     /// binding has a pending connect (connectIssuedAt set), re-check every `connectAttemptTimeout`
-    /// (the first check also waits out a start-delayed reconnect's `connectStartDelay`):
+    /// (330 s, TRIO-101; the first check also waits out a start-delayed reconnect's `connectStartDelay`):
     ///   - `.connecting` past the timeout → wedged: cancel and keep watching. Cancelling a pending
     ///     connect may fire NO delegate callback and CB clears state asynchronously, so we must not
     ///     rescan now (an immediate connectIfNotInFlight would skip as in_flight and re-wedge) — keep
@@ -924,7 +963,13 @@ class G7BluetoothManager: NSObject {
     /// enabled, emit `connect_wedge_persistent` and escalate to central re-init instead of repeating
     /// the cancel-and-reschedule loop (cancel-with-no-callback wedges survive identical retries).
     /// Generation-guarded and pinned to the exact attempt; re-issue is C-210-7-gated.
-    private func scheduleConnectTimeout(_ peripheral: CBPeripheral) {
+    /// TRIO-101: the timeout is 330 s (one 300 s sensor period + margin). Each tick records its
+    /// intended deadline; if a `.connecting` tick runs more than `connectWatchdogLateTickThreshold`
+    /// late, the process was suspended and likely just woken by this connection completing, so it is
+    /// NOT cancelled: emit `connect_timeout_deferred` and re-check once `connectWatchdogRecheckDelay`
+    /// later (same guards, no further deferral, no wedge tick counted). The deferral replaces the
+    /// tick — still exactly one pending closure.
+    private func scheduleConnectTimeout(_ peripheral: CBPeripheral, deferredRecheck: Bool = false) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
         let gen = bindingGeneration
         let pid = peripheral.identifier
@@ -932,18 +977,34 @@ class G7BluetoothManager: NSObject {
         // Only the first tick after an issue carries the start delay; a re-armed tick follows a cancel
         // + re-issue (which sets a fresh delay of its own) or a plain cancel-and-wait.
         let startDelay = bindingState.connectWedgeTicks == 0 ? bindingState.connectStartDelay : 0
-        managerQueue.asyncAfter(deadline: .now() + Self.connectAttemptTimeout + startDelay) { [weak self] in
+        let delay = deferredRecheck ? Self.connectWatchdogRecheckDelay : Self.connectAttemptTimeout + startDelay
+        let intendedAt = Date().addingTimeInterval(delay)
+        managerQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             guard self.bindingGeneration == gen,
                   self.activePeripheralIdentifier == pid,
                   self.bindingState.connectIssuedAt == issuedAt,
                   let peripheral = self.activePeripheral, peripheral.identifier == pid else { return }
-            switch peripheral.state {
-            case .connecting:
+            let lateness = Date().timeIntervalSince(intendedAt)
+            let action = Self.connectWatchdogAction(
+                state: peripheral.state,
+                lateness: lateness,
+                alreadyDeferred: deferredRecheck,
+                wedgeTicksAfterThisTick: self.bindingState.connectWedgeTicks + 1,
+                escalationEnabled: G7BackgroundHints.isConnectWedgeEscalationEnabled
+            )
+            switch action {
+            case .deferRecheck:
+                emitG7Telemetry(
+                    "connect_timeout_deferred",
+                    "peripheral=\(pid.uuidString) lateness_s=\(Int(lateness)) scope=bound"
+                )
+                self.scheduleConnectTimeout(peripheral, deferredRecheck: true)
+            case .escalate, .cancelAndRewatch:
                 self.bindingState.connectWedgeTicks += 1
                 let ticks = self.bindingState.connectWedgeTicks
                 let ageS = Int(Date().timeIntervalSince(issuedAt ?? Date()))
-                if ticks >= 2, G7BackgroundHints.isConnectWedgeEscalationEnabled {
+                if action == .escalate {
                     // Debounce emit to once-per-wedge; escalation is still attempted every tick.
                     if !self.bindingState.wedgePersistentEmitted {
                         emitG7Telemetry(
@@ -957,12 +1018,15 @@ class G7BluetoothManager: NSObject {
                     }
                     // reinit suppressed (Task-4 off or 120s guard) -> keep C-212-1 recovery alive
                 }
-                emitG7Telemetry("connect_timeout", "peripheral=\(pid.uuidString) age_s=\(ageS) \(self.rssiTelemetrySuffix())")
+                emitG7Telemetry(
+                    "connect_timeout",
+                    "peripheral=\(pid.uuidString) age_s=\(ageS) lateness_s=\(Int(lateness)) \(self.rssiTelemetrySuffix())"
+                )
                 self.centralManager.cancelPeripheralConnection(peripheral)
                 self.scheduleConnectTimeout(peripheral)
-            case .disconnecting:
+            case .rewatch:
                 self.scheduleConnectTimeout(peripheral)
-            case .disconnected:
+            case .reissue:
                 emitG7Telemetry("connect_timeout_reissue", "peripheral=\(pid.uuidString)")
                 self.managerQueue_scanForPeripheral()
                 // review #2: if the reissue didn't start a new connect (gated / retrieve-miss /
@@ -971,12 +1035,12 @@ class G7BluetoothManager: NSObject {
                 if self.bindingState.connectIssuedAt == issuedAt {
                     self.scheduleConnectTimeout(peripheral)
                 }
-            case .connected:
+            case .settled:
                 // review #4: normally didConnect already cleared the marker (we never reach here);
                 // clear defensively in case that callback was missed, then stop.
-                self.bindingState.connectIssuedAt = nil
-            @unknown default:
-                break
+                if peripheral.state == .connected {
+                    self.bindingState.connectIssuedAt = nil
+                }
             }
         }
     }
@@ -1056,11 +1120,14 @@ class G7BluetoothManager: NSObject {
     /// cannot disarm a newer attempt's chain. No bindingGeneration guard on purpose: discovery
     /// attempts are binding-independent and stale-attempt cleanup must survive binding resets.
     /// All reissue paths remain C-210-7-gated via connectIfNotInFlight.
-    private func scheduleDiscoveryConnectTimeout(_ peripheral: CBPeripheral) {
+    private func scheduleDiscoveryConnectTimeout(_ peripheral: CBPeripheral, deferredRecheck: Bool = false) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
         let pid = peripheral.identifier
         let issuedAt = pendingDiscoveryConnects[pid]
-        managerQueue.asyncAfter(deadline: .now() + Self.connectAttemptTimeout) { [weak self] in
+        // TRIO-101: same 330 s timeout and late-tick deferral as the bound watchdog (scope=discovery).
+        let delay = deferredRecheck ? Self.connectWatchdogRecheckDelay : Self.connectAttemptTimeout
+        let intendedAt = Date().addingTimeInterval(delay)
+        managerQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             // Superseded (a newer issue/adopt re-stamped the marker) or already retired.
             guard let issuedAt, self.pendingDiscoveryConnects[pid] == issuedAt else { return }
@@ -1074,22 +1141,36 @@ class G7BluetoothManager: NSObject {
                 self.pendingDiscoveryConnects.removeValue(forKey: pid)
                 return
             }
-            switch peripheral.state {
-            case .connecting:
+            let lateness = Date().timeIntervalSince(intendedAt)
+            let action = Self.connectWatchdogAction(
+                state: peripheral.state,
+                lateness: lateness,
+                alreadyDeferred: deferredRecheck,
+                wedgeTicksAfterThisTick: 0,
+                escalationEnabled: false
+            )
+            switch action {
+            case .deferRecheck:
+                emitG7Telemetry(
+                    "connect_timeout_deferred",
+                    "peripheral=\(pid.uuidString) lateness_s=\(Int(lateness)) scope=discovery"
+                )
+                self.scheduleDiscoveryConnectTimeout(peripheral, deferredRecheck: true)
+            case .cancelAndRewatch, .escalate:
                 let ageS = Int(Date().timeIntervalSince(issuedAt))
                 emitG7Telemetry("discovery_connect_timeout", "peripheral=\(pid.uuidString) age_s=\(ageS)")
                 self.centralManager.cancelPeripheralConnection(peripheral)
                 self.scheduleDiscoveryConnectTimeout(peripheral)
-            case .disconnecting:
+            case .rewatch:
                 self.scheduleDiscoveryConnectTimeout(peripheral)
-            case .disconnected:
+            case .reissue:
                 self.pendingDiscoveryConnects.removeValue(forKey: pid)
                 emitG7Telemetry("discovery_connect_timeout_rescan", "peripheral=\(pid.uuidString)")
                 self.managerQueue_scanForPeripheral()
-            case .connected:
-                self.pendingDiscoveryConnects.removeValue(forKey: pid)
-            @unknown default:
-                break
+            case .settled:
+                if peripheral.state == .connected {
+                    self.pendingDiscoveryConnects.removeValue(forKey: pid)
+                }
             }
         }
     }

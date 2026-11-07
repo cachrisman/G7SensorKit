@@ -259,3 +259,77 @@ final class G7CGMManagerTests: XCTestCase {
         XCTAssertEqual(repaired, bluetoothManager.activePeripheralIdentifier)
     }
 }
+
+/// TRIO-101: connect-watchdog decision (late-tick deferral) and timing constants.
+final class G7ConnectWatchdogActionTests: XCTestCase {
+    private func action(
+        _ state: CBPeripheralState,
+        lateness: TimeInterval = 0,
+        deferred: Bool = false,
+        ticks: Int = 1,
+        escalation: Bool = false
+    ) -> G7BluetoothManager.ConnectWatchdogAction {
+        G7BluetoothManager.connectWatchdogAction(
+            state: state,
+            lateness: lateness,
+            alreadyDeferred: deferred,
+            wedgeTicksAfterThisTick: ticks,
+            escalationEnabled: escalation
+        )
+    }
+
+    func testConnectingOnTimeFirstTickCancels() {
+        XCTAssertEqual(action(.connecting), .cancelAndRewatch)
+    }
+
+    func testConnectingLateDefers() {
+        XCTAssertEqual(action(.connecting, lateness: 11), .deferRecheck)
+    }
+
+    func testConnectingLateAlreadyDeferredCancels() {
+        XCTAssertEqual(action(.connecting, lateness: 11, deferred: true), .cancelAndRewatch)
+    }
+
+    func testConnectingSecondTickEscalatesWhenEnabled() {
+        XCTAssertEqual(action(.connecting, ticks: 2, escalation: true), .escalate)
+    }
+
+    func testConnectingSecondTickWithoutEscalationCancels() {
+        XCTAssertEqual(action(.connecting, ticks: 2, escalation: false), .cancelAndRewatch)
+    }
+
+    func testLateWithTicksTwoDefersFirst() {
+        XCTAssertEqual(action(.connecting, lateness: 11, ticks: 2, escalation: true), .deferRecheck)
+    }
+
+    func testLateRecheckWithTicksTwoEscalates() {
+        XCTAssertEqual(action(.connecting, lateness: 11, deferred: true, ticks: 2, escalation: true), .escalate)
+    }
+
+    func testDisconnectingRewatches() {
+        XCTAssertEqual(action(.disconnecting), .rewatch)
+    }
+
+    func testDisconnectedReissues() {
+        XCTAssertEqual(action(.disconnected), .reissue)
+    }
+
+    func testConnectedSettles() {
+        XCTAssertEqual(action(.connected), .settled)
+    }
+
+    func testLatenessAtThresholdIsNotDeferred() {
+        XCTAssertEqual(action(.connecting, lateness: 10), .cancelAndRewatch)
+    }
+
+    func testLateNonConnectingStatesAreNotDeferred() {
+        XCTAssertEqual(action(.disconnected, lateness: 60), .reissue)
+        XCTAssertEqual(action(.connected, lateness: 60), .settled)
+    }
+
+    func testConstants() {
+        XCTAssertEqual(G7BluetoothManager.connectAttemptTimeout, 330)
+        XCTAssertEqual(G7BluetoothManager.connectWatchdogLateTickThreshold, 10)
+        XCTAssertEqual(G7BluetoothManager.connectWatchdogRecheckDelay, 3)
+    }
+}
