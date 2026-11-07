@@ -744,24 +744,78 @@ class G7BluetoothManager: NSObject {
         delegate?.bluetoothManager(self, logEvent: line)
     }
 
-    /// Stock path only (no arm): an active peripheral reconnects on its own; anything else rescans.
-    private func resumeAfterLinkEnded(_ peripheral: CBPeripheral) {
+    /// Why a link ended, which decides how we reconnect (TRIO-101).
+    enum LinkEndCause {
+        /// The sensor closed the link (`CBError.peripheralDisconnected`).
+        case remoteClose
+        /// We cancelled it (watchdog, explicit cancel), or it ended with any other error.
+        case localCancel
+        /// `didFailToConnect`.
+        case failedToConnect
+
+        var telemetryName: String {
+            switch self {
+            case .remoteClose: return "remote_close"
+            case .localCancel: return "local_cancel"
+            case .failedToConnect: return "failed_to_connect"
+            }
+        }
+    }
+
+    enum ReconnectPlan: Equatable {
+        case startDelay(seconds: Int)
+        case rescan(afterSeconds: TimeInterval)
+    }
+
+    /// Chooses the reconnect mode by WHY the link ended (TRIO-101).
+    /// - Not the active peripheral, or central not poweredOn: rescan. C-207-2: the 2 s grace lets the
+    ///   transmitter finish its normal between-reading shutdown AFTER it has delivered an EGV; with no
+    ///   glucose yet (pre-auth / pre-EGV) it is likely still advertising, so rescan at once.
+    /// - watchOS (stock path only; the arm path returns before this): upstream never runs the start
+    ///   delay there because the option doesn't seem to work. Build 236 applied it anyway and watch
+    ///   EGV fell from ~4.3/h to 1.4/h, so rescan as 235 did.
+    /// - iOS, sensor closed the link: it is about to sit in its ~20–24 s advertising tail, so use the
+    ///   start delay to keep the reconnect out of it.
+    /// - iOS, our own cancel or a failed connect: the sensor is usually still mid-window. 235 rescanned
+    ///   at once and recaught the burst; 236's 30 s delay missed it. Rescan.
+    static func reconnectPlan(cause: LinkEndCause, isActivePeripheral: Bool, centralPoweredOn: Bool, isWatchOS: Bool, hadGlucose: Bool) -> ReconnectPlan {
+        let rescan = ReconnectPlan.rescan(afterSeconds: hadGlucose ? 2 : 0)
+        guard isActivePeripheral, centralPoweredOn else { return rescan }
+        if isWatchOS { return rescan }
+        switch cause {
+        case .remoteClose:
+            return .startDelay(seconds: reconnectStartDelay)
+        case .localCancel, .failedToConnect:
+            return rescan
+        }
+    }
+
+    /// Stock path only (no arm): picks start-delay reconnect or rescan per `reconnectPlan`.
+    private func resumeAfterLinkEnded(_ peripheral: CBPeripheral, cause: LinkEndCause) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
-        guard peripheral == activePeripheral, centralManager.state == .poweredOn else {
-            // C-207-2: the 2s grace lets the transmitter finish its normal between-reading shutdown
-            // AFTER it has delivered an EGV. When the link dropped BEFORE any glucose arrived on it
-            // (pre-auth / pre-EGV), the transmitter is likely still in its advertise window, so
-            // rescan at once instead of waiting.
-            let settleDelay: TimeInterval = receivedGlucoseSinceConnect ? 2 : 0
+        #if os(watchOS)
+        let isWatchOS = true
+        #else
+        let isWatchOS = false
+        #endif
+        let plan = G7BluetoothManager.reconnectPlan(
+            cause: cause,
+            isActivePeripheral: peripheral == activePeripheral,
+            centralPoweredOn: centralManager.state == .poweredOn,
+            isWatchOS: isWatchOS,
+            hadGlucose: receivedGlucoseSinceConnect
+        )
+        switch plan {
+        case .rescan(let settleDelay):
             // C-208-15: observability only — makes the self-initiated rescan visible in telemetry.
-            emitG7Telemetry("rescan_scheduled", "delay_s=\(Int(settleDelay)) had_glucose=\(receivedGlucoseSinceConnect)")
+            emitG7Telemetry("rescan_scheduled", "delay_s=\(Int(settleDelay)) had_glucose=\(receivedGlucoseSinceConnect) mode=rescan cause=\(cause.telemetryName)")
             managerQueue.asyncAfter(deadline: .now() + settleDelay) { [weak self] in
                 self?.managerQueue_scanForPeripheral()
             }
-            return
+        case .startDelay(let seconds):
+            emitG7Telemetry("rescan_scheduled", "delay_s=\(seconds) had_glucose=\(receivedGlucoseSinceConnect) mode=start_delay cause=\(cause.telemetryName)")
+            reconnectAfterAdvertisingTail(peripheral)
         }
-        emitG7Telemetry("rescan_scheduled", "delay_s=\(G7BluetoothManager.reconnectStartDelay) had_glucose=\(receivedGlucoseSinceConnect) mode=start_delay")
-        reconnectAfterAdvertisingTail(peripheral)
     }
 
     /// C-216-A: shared `last_rssi=`/`rssi_age_s=` suffix for the `attach_path` and `connect_timeout`
@@ -1435,6 +1489,13 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         dispatchPrecondition(condition: .onQueue(managerQueue))
+        // TRIO-101: why the link ended decides the reconnect mode (see `reconnectPlan`).
+        let cause: LinkEndCause
+        if let error = error as NSError?, CBError(_nsError: error).code == .peripheralDisconnected {
+            cause = .remoteClose
+        } else {
+            cause = .localCancel
+        }
         // C-210-6 (review A): clear the connection clock only when the ACTIVE binding disconnects, so
         // a stray non-active peripheral's disconnect can't suppress re-kick for the active zombie.
         if peripheral.identifier == activePeripheralIdentifier {
@@ -1455,13 +1516,7 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         }
 
         if let peripheralManager = managedPeripherals[peripheral.identifier] {
-            let remoteDisconnect: Bool
-            if let error = error as NSError?, CBError(_nsError: error).code == .peripheralDisconnected {
-                remoteDisconnect = true
-            } else {
-                remoteDisconnect = false
-            }
-            self.delegate?.peripheralDidDisconnect(self, peripheralManager: peripheralManager, wasRemoteDisconnect: remoteDisconnect)
+            self.delegate?.peripheralDidDisconnect(self, peripheralManager: peripheralManager, wasRemoteDisconnect: cause == .remoteClose)
         }
 
         if peripheral != activePeripheral {
@@ -1469,7 +1524,7 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         }
 
         if acquisitionArm?.disconnected(peripheral, error: error) == true { return }
-        resumeAfterLinkEnded(peripheral)
+        resumeAfterLinkEnded(peripheral, cause: cause)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
@@ -1496,7 +1551,7 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
             managedPeripherals.removeValue(forKey: peripheral.identifier)
         }
 
-        resumeAfterLinkEnded(peripheral)
+        resumeAfterLinkEnded(peripheral, cause: .failedToConnect)
     }
 }
 

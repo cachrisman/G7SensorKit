@@ -333,3 +333,48 @@ final class G7ConnectWatchdogActionTests: XCTestCase {
         XCTAssertEqual(G7BluetoothManager.connectWatchdogRecheckDelay, 3)
     }
 }
+
+final class G7ReconnectPlanTests: XCTestCase {
+    private func plan(
+        _ cause: G7BluetoothManager.LinkEndCause,
+        active: Bool = true,
+        poweredOn: Bool = true,
+        watchOS: Bool = false,
+        glucose: Bool = false
+    ) -> G7BluetoothManager.ReconnectPlan {
+        return G7BluetoothManager.reconnectPlan(cause: cause, isActivePeripheral: active, centralPoweredOn: poweredOn, isWatchOS: watchOS, hadGlucose: glucose)
+    }
+
+    func testIOSRemoteCloseUsesStartDelay() {
+        XCTAssertEqual(plan(.remoteClose), .startDelay(seconds: 30))
+        XCTAssertEqual(plan(.remoteClose, glucose: true), .startDelay(seconds: 30))
+    }
+
+    func testIOSLocalCancelRescans() {
+        XCTAssertEqual(plan(.localCancel, glucose: true), .rescan(afterSeconds: 2))
+        XCTAssertEqual(plan(.localCancel, glucose: false), .rescan(afterSeconds: 0))
+    }
+
+    func testIOSFailedToConnectRescansAtOnce() {
+        XCTAssertEqual(plan(.failedToConnect), .rescan(afterSeconds: 0))
+    }
+
+    func testWatchOSRemoteCloseRescans() {
+        XCTAssertEqual(plan(.remoteClose, watchOS: true, glucose: true), .rescan(afterSeconds: 2))
+        XCTAssertEqual(plan(.remoteClose, watchOS: true), .rescan(afterSeconds: 0))
+    }
+
+    func testWatchOSFailedToConnectRescans() {
+        XCTAssertEqual(plan(.failedToConnect, watchOS: true), .rescan(afterSeconds: 0))
+    }
+
+    func testNonActivePeripheralRescans() {
+        XCTAssertEqual(plan(.remoteClose, active: false, glucose: true), .rescan(afterSeconds: 2))
+        XCTAssertEqual(plan(.remoteClose, active: false), .rescan(afterSeconds: 0))
+    }
+
+    func testNotPoweredOnRescans() {
+        XCTAssertEqual(plan(.remoteClose, poweredOn: false, glucose: true), .rescan(afterSeconds: 2))
+        XCTAssertEqual(plan(.remoteClose, poweredOn: false), .rescan(afterSeconds: 0))
+    }
+}
