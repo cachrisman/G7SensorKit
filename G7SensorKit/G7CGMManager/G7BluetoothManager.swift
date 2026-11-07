@@ -1630,7 +1630,9 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         // Ignore errors indicating the peripheral disconnected remotely, as that's expected behavior
         if let error = error as NSError?, CBError(_nsError: error).code != .peripheralDisconnected {
             log.error("%{public}@: %{public}@", #function, error)
-            if let peripheralManager = activePeripheralManager {
+            // TRIO-101 review: only the ACTIVE peripheral's failure is a readying failure of the active
+            // sensor; declined/stray peripherals (e.g. the stale-restored-connect cancel) must not be.
+            if peripheral.identifier == activePeripheralIdentifier, let peripheralManager = activePeripheralManager {
                 self.delegate?.bluetoothManager(self, readyingFailed: peripheralManager, with: error)
             }
         }
@@ -1661,7 +1663,8 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
         )
 
         log.error("%{public}@: %{public}@", #function, String(describing: error))
-        if let error = error, let peripheralManager = activePeripheralManager {
+        // TRIO-101 review: forward only for the ACTIVE peripheral (see didDisconnect).
+        if let error = error, peripheral.identifier == activePeripheralIdentifier, let peripheralManager = activePeripheralManager {
             self.delegate?.bluetoothManager(self, readyingFailed: peripheralManager, with: error)
         }
 
