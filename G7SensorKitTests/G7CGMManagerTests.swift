@@ -378,3 +378,32 @@ final class G7ReconnectPlanTests: XCTestCase {
         XCTAssertEqual(plan(.remoteClose, poweredOn: false), .rescan(afterSeconds: 0))
     }
 }
+
+/// TRIO-101: a restored, already-connected active peripheral is resumed by hand only on watchOS
+/// without the acquisition arm (CoreBluetooth does not re-deliver didConnect on restore).
+final class G7RestoredConnectedResumeTests: XCTestCase {
+    private let allStates: [CBPeripheralState] = [.disconnected, .connecting, .connected, .disconnecting]
+
+    func testFullTruthTable() {
+        for watchOS in [true, false] {
+            for arm in [true, false] {
+                for active in [true, false] {
+                    for state in allStates {
+                        let expected = watchOS && !arm && active && state == .connected
+                        XCTAssertEqual(
+                            G7BluetoothManager.shouldResumeRestoredConnected(isWatchOS: watchOS, armActive: arm, isActivePeripheral: active, state: state),
+                            expected,
+                            "watchOS=\(watchOS) arm=\(arm) active=\(active) state=\(state.rawValue)"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    func testResumesOnlyInTheTargetCase() {
+        XCTAssertTrue(G7BluetoothManager.shouldResumeRestoredConnected(isWatchOS: true, armActive: false, isActivePeripheral: true, state: .connected))
+        XCTAssertFalse(G7BluetoothManager.shouldResumeRestoredConnected(isWatchOS: false, armActive: false, isActivePeripheral: true, state: .connected))
+        XCTAssertFalse(G7BluetoothManager.shouldResumeRestoredConnected(isWatchOS: true, armActive: true, isActivePeripheral: true, state: .connected))
+    }
+}

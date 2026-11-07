@@ -296,6 +296,10 @@ class G7BluetoothManager: NSObject {
         var connectStartDelay: TimeInterval = 0
     }
     private var bindingState = BindingBLEState()
+    /// TRIO-101: identifier of a restored, already-connected active peripheral whose `didConnect`
+    /// could not run at `willRestoreState` because the central was not yet `.poweredOn`. Consumed
+    /// (and always cleared) at the next `.poweredOn`. managerQueue-isolated.
+    private var pendingRestoredConnectedResume: UUID?
     /// Monotonic id bumped on every binding reset, captured by the delayed-retry closure so a stale
     /// closure from a prior binding no-ops instead of clearing the NEW binding's retry flag (review B).
     private var bindingGeneration = 0
@@ -765,6 +769,14 @@ class G7BluetoothManager: NSObject {
     enum ReconnectPlan: Equatable {
         case startDelay(seconds: Int)
         case rescan(afterSeconds: TimeInterval)
+    }
+
+    /// TRIO-101: whether a restored peripheral must be resumed by hand. CoreBluetooth does not
+    /// re-deliver `didConnect` for a link that was already up when it restored the app, and on
+    /// watchOS without the acquisition arm nothing else (the arm's `restored()` does it) starts
+    /// auth and the session. True only for watchOS + no arm + active binding + `.connected`.
+    static func shouldResumeRestoredConnected(isWatchOS: Bool, armActive: Bool, isActivePeripheral: Bool, state: CBPeripheralState) -> Bool {
+        return isWatchOS && !armActive && isActivePeripheral && state == .connected
     }
 
     /// Chooses the reconnect mode by WHY the link ended (TRIO-101).
@@ -1380,6 +1392,26 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
                 SensorServiceUUID.advertisement.cbUUID,
                 SensorServiceUUID.cgmService.cbUUID
             ]])
+            // TRIO-101: willRestoreState precedes poweredOn, so a restored, already-connected active
+            // peripheral could not be resumed there (didConnect's readied call is gated on
+            // .poweredOn). Always clear the marker so a later poweredOn after a radio reset cannot
+            // act on a stale one.
+            let pendingResume = pendingRestoredConnectedResume
+            pendingRestoredConnectedResume = nil
+            if let pendingResume = pendingResume {
+                if acquisitionArm != nil {
+                    emitG7Telemetry("restored_connected_resume_skipped", "reason=arm_on peripheral=\(pendingResume.uuidString)")
+                } else if let active = activePeripheral, active.identifier == pendingResume {
+                    if active.state == .connected {
+                        emitG7Telemetry("restored_connected_resumed", "timing=powered_on peripheral=\(pendingResume.uuidString)")
+                        self.centralManager(central, didConnect: active)
+                    } else {
+                        emitG7Telemetry("restored_connected_resume_skipped", "reason=not_connected peripheral=\(pendingResume.uuidString)")
+                    }
+                } else {
+                    emitG7Telemetry("restored_connected_resume_skipped", "reason=not_active peripheral=\(pendingResume.uuidString)")
+                }
+            }
             managerQueue_scanForPeripheral()
         case .resetting, .poweredOff, .unauthorized, .unknown, .unsupported:
             fallthrough
@@ -1427,6 +1459,31 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
                 log.default("Restoring peripheral from state: %{public}@", peripheral.identifier.uuidString)
                 handleDiscoveredPeripheral(peripheral)
                 acquisitionArm?.restored(peripheral)
+            }
+
+            // TRIO-101: restore does not re-deliver didConnect for a link already up, and with the
+            // arm off nothing else starts auth/session (52 of 236-export relaunches had the active
+            // sensor connected; 50 never got didConnect). willRestoreState precedes poweredOn, so
+            // resume now only if the radio is already on; otherwise defer to poweredOn.
+            pendingRestoredConnectedResume = nil
+            #if os(watchOS)
+            let isWatchOS = true
+            #else
+            let isWatchOS = false
+            #endif
+            if let peripheral = peripherals.first(where: { $0.identifier == activePeripheralIdentifier }),
+               Self.shouldResumeRestoredConnected(
+                   isWatchOS: isWatchOS,
+                   armActive: acquisitionArm != nil,
+                   isActivePeripheral: true,
+                   state: peripheral.state
+               ) {
+                if central.state == .poweredOn {
+                    emitG7Telemetry("restored_connected_resumed", "timing=immediate peripheral=\(peripheral.identifier.uuidString)")
+                    self.centralManager(central, didConnect: peripheral)
+                } else {
+                    pendingRestoredConnectedResume = peripheral.identifier
+                }
             }
         }
     }
