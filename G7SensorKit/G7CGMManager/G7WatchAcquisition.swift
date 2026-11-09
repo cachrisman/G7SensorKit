@@ -196,7 +196,14 @@ final class G7WatchAcquisition: G7AcquisitionArm {
     /// An already-connected peripheral gets no second didConnect: run that path now so the
     /// handshake starts on the link the system brought us back for.
     func restored(_ peripheral: CBPeripheral) {
-        if peripheral.state == .connected { manager.centralManager(central, didConnect: peripheral) }
+        if peripheral.state == .connected {
+            // The synthesized didConnect only readies the link (and starts the auth subscribe) when the
+            // central is already poweredOn; restore usually precedes poweredOn, so will_ready=false marks
+            // a restored link whose subscribe is skipped (TRIO-107).
+            let willReady = central.state == .poweredOn
+            emitG7Telemetry("restored_didconnect_synthesized", "peripheral=\(peripheral.identifier.uuidString) central_state=\(central.state.rawValue) will_ready=\(willReady)")
+            manager.centralManager(central, didConnect: peripheral)
+        }
     }
 
     func noteReading(at timestamp: Date) {
