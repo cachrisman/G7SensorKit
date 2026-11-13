@@ -380,31 +380,66 @@ final class G7ReconnectPlanTests: XCTestCase {
 }
 
 /// TRIO-101: a restored, already-connected active peripheral is resumed by hand only on watchOS
-/// without the acquisition arm (CoreBluetooth does not re-deliver didConnect on restore).
+/// (CoreBluetooth does not re-deliver didConnect on restore); under the arm only before poweredOn.
 final class G7RestoredConnectedResumeTests: XCTestCase {
     private let allStates: [CBPeripheralState] = [.disconnected, .connecting, .connected, .disconnecting]
+
+    private func decide(
+        watchOS: Bool = true, arm: Bool = false, active: Bool = true,
+        state: CBPeripheralState = .connected, poweredOn: Bool = true
+    ) -> G7BluetoothManager.RestoredConnectedResume {
+        G7BluetoothManager.restoredConnectedResume(isWatchOS: watchOS, armActive: arm, isActivePeripheral: active, state: state, centralPoweredOn: poweredOn)
+    }
 
     func testFullTruthTable() {
         for watchOS in [true, false] {
             for arm in [true, false] {
                 for active in [true, false] {
                     for state in allStates {
-                        let expected = watchOS && !arm && active && state == .connected
-                        XCTAssertEqual(
-                            G7BluetoothManager.shouldResumeRestoredConnected(isWatchOS: watchOS, armActive: arm, isActivePeripheral: active, state: state),
-                            expected,
-                            "watchOS=\(watchOS) arm=\(arm) active=\(active) state=\(state.rawValue)"
-                        )
+                        for poweredOn in [true, false] {
+                            var expected = G7BluetoothManager.RestoredConnectedResume.none
+                            if watchOS && active && state == .connected {
+                                expected = poweredOn ? (arm ? .none : .resumeNow) : .deferToPoweredOn
+                            }
+                            XCTAssertEqual(
+                                decide(watchOS: watchOS, arm: arm, active: active, state: state, poweredOn: poweredOn),
+                                expected,
+                                "watchOS=\(watchOS) arm=\(arm) active=\(active) state=\(state.rawValue) poweredOn=\(poweredOn)"
+                            )
+                        }
                     }
                 }
             }
         }
     }
 
-    func testResumesOnlyInTheTargetCase() {
-        XCTAssertTrue(G7BluetoothManager.shouldResumeRestoredConnected(isWatchOS: true, armActive: false, isActivePeripheral: true, state: .connected))
-        XCTAssertFalse(G7BluetoothManager.shouldResumeRestoredConnected(isWatchOS: false, armActive: false, isActivePeripheral: true, state: .connected))
-        XCTAssertFalse(G7BluetoothManager.shouldResumeRestoredConnected(isWatchOS: true, armActive: true, isActivePeripheral: true, state: .connected))
+    func testStockPoweredOnResumesNow() {
+        XCTAssertEqual(decide(arm: false, poweredOn: true), .resumeNow)
+    }
+
+    func testStockNotPoweredOnDefers() {
+        XCTAssertEqual(decide(arm: false, poweredOn: false), .deferToPoweredOn)
+    }
+
+    func testArmNotPoweredOnDefers() {
+        XCTAssertEqual(decide(arm: true, poweredOn: false), .deferToPoweredOn)
+    }
+
+    func testArmPoweredOnDoesNotDoubleTheSynthesizedDidConnect() {
+        XCTAssertEqual(decide(arm: true, poweredOn: true), .none)
+    }
+
+    func testNonWatchOSIsNone() {
+        XCTAssertEqual(decide(watchOS: false, poweredOn: true), .none)
+        XCTAssertEqual(decide(watchOS: false, poweredOn: false), .none)
+    }
+
+    func testNotActivePeripheralIsNone() {
+        XCTAssertEqual(decide(active: false, poweredOn: false), .none)
+    }
+
+    func testNotConnectedIsNone() {
+        XCTAssertEqual(decide(state: .connecting, poweredOn: false), .none)
     }
 }
 

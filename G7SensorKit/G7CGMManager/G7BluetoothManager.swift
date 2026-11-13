@@ -775,12 +775,24 @@ class G7BluetoothManager: NSObject {
         case rescan(afterSeconds: TimeInterval)
     }
 
-    /// TRIO-101: whether a restored peripheral must be resumed by hand. CoreBluetooth does not
-    /// re-deliver `didConnect` for a link that was already up when it restored the app, and on
-    /// watchOS without the acquisition arm nothing else (the arm's `restored()` does it) starts
-    /// auth and the session. True only for watchOS + no arm + active binding + `.connected`.
-    static func shouldResumeRestoredConnected(isWatchOS: Bool, armActive: Bool, isActivePeripheral: Bool, state: CBPeripheralState) -> Bool {
-        return isWatchOS && !armActive && isActivePeripheral && state == .connected
+    enum RestoredConnectedResume: Equatable {
+        case none
+        case resumeNow
+        case deferToPoweredOn
+    }
+
+    /// TRIO-101/TRIO-111: how a restored peripheral must be resumed by hand. CoreBluetooth does not
+    /// re-deliver `didConnect` for a link that was already up when it restored the app, and
+    /// didConnect only readies the link (starts auth) once the central is poweredOn. Only watchOS,
+    /// the active binding and `.connected` qualify. Stock: resume now if poweredOn, else at
+    /// poweredOn. Arm on: the arm's `restored()` already synthesizes didConnect when poweredOn
+    /// (do not double it); before poweredOn it does not, so defer to poweredOn.
+    static func restoredConnectedResume(isWatchOS: Bool, armActive: Bool, isActivePeripheral: Bool, state: CBPeripheralState, centralPoweredOn: Bool) -> RestoredConnectedResume {
+        guard isWatchOS, isActivePeripheral, state == .connected else { return .none }
+        if centralPoweredOn {
+            return armActive ? .none : .resumeNow
+        }
+        return .deferToPoweredOn
     }
 
     /// TRIO-101: whether a restored peripheral is a stale pending connect to cancel. Every relaunch
@@ -1413,11 +1425,9 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
             let pendingResume = pendingRestoredConnectedResume
             pendingRestoredConnectedResume = nil
             if let pendingResume = pendingResume {
-                if acquisitionArm != nil {
-                    emitG7Telemetry("restored_connected_resume_skipped", "reason=arm_on peripheral=\(pendingResume.uuidString)")
-                } else if let active = activePeripheral, active.identifier == pendingResume {
+                if let active = activePeripheral, active.identifier == pendingResume {
                     if active.state == .connected {
-                        emitG7Telemetry("restored_connected_resumed", "timing=powered_on peripheral=\(pendingResume.uuidString)")
+                        emitG7Telemetry("restored_connected_resumed", "timing=powered_on arm=\(acquisitionArm != nil ? "on" : "off") peripheral=\(pendingResume.uuidString)")
                         self.centralManager(central, didConnect: active)
                     } else {
                         emitG7Telemetry("restored_connected_resume_skipped", "reason=not_connected peripheral=\(pendingResume.uuidString)")
@@ -1492,18 +1502,21 @@ extension G7BluetoothManager: CBCentralManagerDelegate {
             #else
             let isWatchOS = false
             #endif
-            if let peripheral = peripherals.first(where: { $0.identifier == activePeripheralIdentifier }),
-               Self.shouldResumeRestoredConnected(
-                   isWatchOS: isWatchOS,
-                   armActive: acquisitionArm != nil,
-                   isActivePeripheral: true,
-                   state: peripheral.state
-               ) {
-                if central.state == .poweredOn {
+            if let peripheral = peripherals.first(where: { $0.identifier == activePeripheralIdentifier }) {
+                switch Self.restoredConnectedResume(
+                    isWatchOS: isWatchOS,
+                    armActive: acquisitionArm != nil,
+                    isActivePeripheral: true,
+                    state: peripheral.state,
+                    centralPoweredOn: central.state == .poweredOn
+                ) {
+                case .resumeNow:
                     emitG7Telemetry("restored_connected_resumed", "timing=immediate peripheral=\(peripheral.identifier.uuidString)")
                     self.centralManager(central, didConnect: peripheral)
-                } else {
+                case .deferToPoweredOn:
                     pendingRestoredConnectedResume = peripheral.identifier
+                case .none:
+                    break
                 }
             }
 

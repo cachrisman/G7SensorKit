@@ -198,10 +198,13 @@ final class G7WatchAcquisition: G7AcquisitionArm {
     func restored(_ peripheral: CBPeripheral) {
         if peripheral.state == .connected {
             // The synthesized didConnect only readies the link (and starts the auth subscribe) when the
-            // central is already poweredOn; restore usually precedes poweredOn, so will_ready=false marks
-            // a restored link whose subscribe is skipped (TRIO-107).
-            let willReady = central.state == .poweredOn
-            emitG7Telemetry("restored_didconnect_synthesized", "peripheral=\(peripheral.identifier.uuidString) central_state=\(central.state.rawValue) will_ready=\(willReady)")
+            // central is already poweredOn; restore usually precedes poweredOn, so before then the
+            // manager defers the resume to poweredOn (TRIO-111) instead of a no-subscribe didConnect.
+            guard central.state == .poweredOn else {
+                emitG7Telemetry("restored_didconnect_deferred", "peripheral=\(peripheral.identifier.uuidString) central_state=\(central.state.rawValue)")
+                return
+            }
+            emitG7Telemetry("restored_didconnect_synthesized", "peripheral=\(peripheral.identifier.uuidString) central_state=\(central.state.rawValue) will_ready=true")
             manager.centralManager(central, didConnect: peripheral)
         }
     }
