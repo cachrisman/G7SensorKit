@@ -667,6 +667,10 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
 
         if skipBackgroundGATT && !gapTriggeredBackfill {
             emitG7Telemetry("background_gatt_skipped", "backfill_subscribe=true extended_version_pending=\(needsVersionInfo) sequence_gap=\(sequenceGap)")
+            // TRIO-099: a real gap held back by the background cap never reaches requestMissedReadingsIfNeeded, so log its skip reason here.
+            if priorSequence != nil, sequenceGap > 1 {
+                emitG7Telemetry("backfill_request_skipped", "reason=background_backfill_cap sequence_gap=\(sequenceGap) sequence=\(message.sequence)")
+            }
         } else {
             if gapTriggeredBackfill {
                 lastBackgroundBackfillAttemptAt = now
